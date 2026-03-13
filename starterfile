@@ -1,0 +1,2746 @@
+#!/usr/bin/env bash
+###############################################################################
+#  OpenClaw + Local LLM — Instalador Onipotente para Linux
+#  Compatível com: Ubuntu/Debian, Fedora/RHEL/CentOS
+#
+#  O que este script faz (100 % não-interativo):
+#    1. Detecta a distro e instala dependências (Node 20+, curl, git, jq …)
+#    2. Analisa o hardware (RAM, CPU, GPU NVIDIA/AMD/Intel) e seleciona
+#       automaticamente o melhor modelo LLM para o seu sistema
+#    3. Instala o Ollama e baixa o modelo escolhido
+#    4. Instala o OpenClaw via npm e cria serviço systemd
+#    5. Configura o OpenClaw para usar o Ollama local como backend LLM
+#    6. Cria 4 agentes especializados (Manager, Backend Dev, Frontend Dev, QA)
+#    7. Aplica limites de CPU/RAM para não fritar o servidor
+#    8. Instala o utilitário 'openclaw-ctl' para controle fácil dos serviços
+#    9. Configura HTTPS via Caddy reverse proxy (certificado auto-assinado)
+#   10. Libera portas no firewall (ufw / firewalld), trata SELinux
+#   11. Exibe URL + token para acesso imediato via navegador
+#
+#  Uso:
+#    chmod +x openclaw-fullstack-installer.sh
+#    sudo ./openclaw-fullstack-installer.sh            # Instalar
+#    sudo ./openclaw-fullstack-installer.sh --uninstall # Desinstalar tudo
+#
+#  Após a instalação, use 'openclaw-ctl' para gerenciar:
+#    openclaw-ctl start   — Inicia todos os serviços
+#    openclaw-ctl stop    — Para tudo (libera recursos)
+#    openclaw-ctl status  — Mostra status de todos os serviços
+#    openclaw-ctl restart — Reinicia tudo
+#    openclaw-ctl logs    — Logs em tempo real
+###############################################################################
+set -euo pipefail
+IFS=$'\n\t'
+
+# ─── Trap para debug: mostra a última linha executada se o script abortar ────
+trap 'err "Script abortou na linha $LINENO (último comando: $BASH_COMMAND, exit code: $?)"' ERR
+
+# ─── Cores ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+log()  { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+err()  { echo -e "${RED}[ERRO]${NC}  $*" >&2; }
+info() { echo -e "${CYAN}[INFO]${NC}  $*"; }
+banner() {
+  echo ""
+  echo -e "${BOLD}${CYAN}=======================================${NC}"
+  echo -e "${BOLD}${CYAN}  $*${NC}"
+  echo -e "${BOLD}${CYAN}=======================================${NC}"
+  echo ""
+}
+
+# ─── Verificação de root ─────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+  err "Este script precisa ser executado como root (sudo)."
+  exit 1
+fi
+
+# Usuário real (quem chamou sudo)
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(eval echo "~${REAL_USER}")
+
+# ─── Variáveis globais ──────────────────────────────────────────────────────
+OPENCLAW_CONFIG_DIR="${REAL_HOME}/.openclaw"
+OPENCLAW_WORKSPACE_DIR="${OPENCLAW_CONFIG_DIR}/workspace"
+OPENCLAW_CTL_PATH="/usr/local/bin/openclaw-ctl"
+OLLAMA_MODEL=""  # Será definido automaticamente por detect_hardware()
+OLLAMA_NUM_CTX=4096
+OLLAMA_PORT=11434
+GATEWAY_PORT=18789
+HTTPS_PORT=443
+DISTRO=""
+PKG_MGR=""
+
+# ─── Variáveis de hardware (preenchidas por detect_hardware) ────────────────
+HW_RAM_GB=0
+HW_CPU_CORES=0
+HW_CPU_MODEL=""
+HW_GPU_VENDOR=""      # nvidia | amd | intel | none
+HW_GPU_MODEL=""
+HW_GPU_VRAM_MB=0
+HW_TIER=""            # minimal | low | mid | high | ultra
+HW_MODEL_REASON=""
+
+# ─── Modo de instalação ──────────────────────────────────────────────────────
+INSTALL_MODE="local"        # local | remote
+REMOTE_PROVIDER=""          # openai | gemini | groq | mistral | openrouter | together | custom
+REMOTE_PROVIDER_NAME=""     # nome para exibição
+REMOTE_BASE_URL=""          # endpoint OpenAI-compatível do provedor
+REMOTE_API_KEY=""           # chave de API (nunca gravada em disco)
+REMOTE_MODEL=""             # nome do modelo no provedor
+
+###############################################################################
+# 0. SELEÇÃO DO MODO DE INSTALAÇÃO
+###############################################################################
+select_install_mode() {
+  echo ""
+  echo -e "${BOLD}${CYAN}=======================================${NC}"
+  echo -e "${BOLD}${CYAN}  Tipo de instalação${NC}"
+  echo -e "${BOLD}${CYAN}=======================================${NC}"
+  echo ""
+  echo -e "  Como os agentes de IA devem se comunicar?"
+  echo ""
+  echo -e "  ${BOLD}${GREEN}[1]${NC} ${BOLD}Local Code Team${NC}  ${DIM}(padrão)${NC}"
+  echo -e "      LLM roda ${GREEN}localmente${NC} no servidor via Ollama"
+  echo -e "      ${DIM}Sem custos de API — requer hardware adequado (min 4 GB RAM)${NC}"
+  echo ""
+  echo -e "  ${BOLD}${CYAN}[2]${NC} ${BOLD}Remote Code Team${NC}"
+  echo -e "      LLM na ${CYAN}nuvem${NC} — escolha o provedor (OpenAI, Gemini, Groq...)"
+  echo -e "      ${DIM}Requer chave de API — sem requisitos de hardware na máquina${NC}"
+  echo ""
+
+  local choice
+  read -r -p "  Digite sua escolha [1/2] (padrão: 1): " choice
+
+  case "${choice:-1}" in
+    1) INSTALL_MODE="local"  ; log "Modo selecionado: Local Code Team"  ;;
+    2) INSTALL_MODE="remote" ; log "Modo selecionado: Remote Code Team" ;;
+    *)
+      warn "Opção inválida. Usando modo Local."
+      INSTALL_MODE="local"
+      ;;
+  esac
+  echo ""
+}
+
+# ─── Helper: lista de modelos numerada ───────────────────────────────────────
+_select_model_from_list() {
+  local models=("$@")
+  echo ""
+  echo -e "  ${BOLD}Modelos disponíveis:${NC}"
+  local i=1
+  for m in "${models[@]}"; do
+    echo -e "    ${GREEN}[${i}]${NC} ${m}"
+    ((i++))
+  done
+  echo -e "    ${GREEN}[${i}]${NC} Digitar manualmente"
+  echo ""
+
+  local choice
+  read -r -p "  Selecione o modelo [1-${i}] (padrão: 1): " choice
+  choice="${choice:-1}"
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
+    REMOTE_MODEL="${models[$((choice - 1))]}"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice == i )); then
+    read -r -p "  Digite o nome do modelo: " REMOTE_MODEL
+  else
+    REMOTE_MODEL="${models[0]}"
+    warn "Opção inválida. Usando: ${REMOTE_MODEL}"
+  fi
+
+  log "Modelo: ${REMOTE_MODEL}"
+}
+
+# ─── Valida a chave de API com uma chamada de teste ──────────────────────────
+_validate_remote_api() {
+  banner "Validando chave de API"
+  info "Testando conexão com ${REMOTE_PROVIDER_NAME} (modelo: ${REMOTE_MODEL})..."
+
+  local payload
+  payload='{"model":"'"${REMOTE_MODEL}"'","messages":[{"role":"user","content":"hi"}],"max_tokens":1}'
+
+  local raw_response http_code body
+  raw_response=$(curl -s --max-time 20 \
+    -X POST "${REMOTE_BASE_URL}/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${REMOTE_API_KEY}" \
+    -d "$payload" \
+    -w "\n__HTTP_CODE__%{http_code}" 2>/dev/null) || true
+
+  http_code=$(echo "$raw_response" | grep "__HTTP_CODE__" | sed 's/__HTTP_CODE__//')
+  body=$(echo "$raw_response" | grep -v "__HTTP_CODE__")
+
+  case "$http_code" in
+    200)
+      log "Chave de API válida. Conexão com ${REMOTE_PROVIDER_NAME} confirmada."
+      ;;
+    401|403)
+      err "Chave de API inválida ou sem permissão (HTTP ${http_code})."
+      err "Verifique sua chave e tente novamente."
+      if [[ -n "$body" ]]; then err "Detalhe: $(echo "$body" | head -3)"; fi
+      exit 1
+      ;;
+    404)
+      err "Modelo '${REMOTE_MODEL}' não encontrado no provedor (HTTP 404)."
+      err "Verifique o nome exato do modelo para ${REMOTE_PROVIDER_NAME}."
+      if [[ -n "$body" ]]; then err "Detalhe: $(echo "$body" | head -3)"; fi
+      exit 1
+      ;;
+    429)
+      warn "Rate limit atingido (HTTP 429) — chave válida, muitas requisições simultâneas."
+      warn "Continuando instalação..."
+      ;;
+    "")
+      err "Sem resposta do servidor. Verifique a URL base: ${REMOTE_BASE_URL}"
+      err "e se há conexão com a internet."
+      exit 1
+      ;;
+    *)
+      warn "Resposta inesperada da API: HTTP ${http_code}."
+      warn "Continuando. Se os agentes não funcionarem, verifique modelo e URL base."
+      ;;
+  esac
+}
+
+# ─── Menu principal de seleção de provedor remoto ────────────────────────────
+select_remote_provider() {
+  banner "Selecione o provedor de IA remoto"
+
+  echo -e "  Provedores com API OpenAI-compatível:"
+  echo ""
+  echo -e "  ${BOLD}${GREEN}[1]${NC} ${BOLD}OpenAI${NC}"
+  echo -e "      ${DIM}GPT-4o, GPT-4o-mini, GPT-4-turbo${NC}"
+  echo -e "      Obter chave: ${CYAN}https://platform.openai.com/api-keys${NC}"
+  echo ""
+  echo -e "  ${BOLD}${GREEN}[2]${NC} ${BOLD}Google Gemini${NC}"
+  echo -e "      ${DIM}Gemini 2.0 Flash, Gemini 1.5 Pro — tier gratuito disponível${NC}"
+  echo -e "      Obter chave: ${CYAN}https://aistudio.google.com/apikey${NC}"
+  echo ""
+  echo -e "  ${BOLD}${GREEN}[3]${NC} ${BOLD}Groq${NC}  ${DIM}(tier gratuito — inferência extremamente rápida)${NC}"
+  echo -e "      ${DIM}Llama 3.3 70B, Llama 3.1 8B, Mixtral 8x7B${NC}"
+  echo -e "      Obter chave: ${CYAN}https://console.groq.com/keys${NC}"
+  echo ""
+  echo -e "  ${BOLD}${GREEN}[4]${NC} ${BOLD}Mistral AI${NC}"
+  echo -e "      ${DIM}Mistral Large, Mistral Small, Codestral${NC}"
+  echo -e "      Obter chave: ${CYAN}https://console.mistral.ai/api-keys${NC}"
+  echo ""
+  echo -e "  ${BOLD}${GREEN}[5]${NC} ${BOLD}OpenRouter${NC}  ${DIM}(acesso a 200+ modelos: Claude, GPT-4, Llama, Gemini...)${NC}"
+  echo -e "      ${DIM}Você escolhe o modelo pelo ID (ex: anthropic/claude-sonnet-4-6)${NC}"
+  echo -e "      Obter chave: ${CYAN}https://openrouter.ai/keys${NC}"
+  echo ""
+  echo -e "  ${BOLD}${GREEN}[6]${NC} ${BOLD}Together AI${NC}"
+  echo -e "      ${DIM}Llama 3, Qwen 2.5, Mistral — modelos open-source em nuvem${NC}"
+  echo -e "      Obter chave: ${CYAN}https://api.together.ai/settings/api-keys${NC}"
+  echo ""
+  echo -e "  ${BOLD}${GREEN}[7]${NC} ${BOLD}Personalizado${NC}  ${DIM}(qualquer endpoint OpenAI-compatível)${NC}"
+  echo -e "      ${DIM}LM Studio, vLLM, liteLLM proxy, Ollama remoto, etc.${NC}"
+  echo ""
+
+  local choice
+  read -r -p "  Digite sua escolha [1-7]: " choice
+
+  case "$choice" in
+    1)
+      REMOTE_PROVIDER="openai"
+      REMOTE_PROVIDER_NAME="OpenAI"
+      REMOTE_BASE_URL="https://api.openai.com/v1"
+      _select_model_from_list "gpt-4o" "gpt-4o-mini" "gpt-4-turbo" "gpt-3.5-turbo"
+      ;;
+    2)
+      REMOTE_PROVIDER="gemini"
+      REMOTE_PROVIDER_NAME="Google Gemini"
+      REMOTE_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai"
+      _select_model_from_list "gemini-2.0-flash" "gemini-1.5-pro" "gemini-1.5-flash"
+      ;;
+    3)
+      REMOTE_PROVIDER="groq"
+      REMOTE_PROVIDER_NAME="Groq"
+      REMOTE_BASE_URL="https://api.groq.com/openai/v1"
+      _select_model_from_list \
+        "llama-3.3-70b-versatile" \
+        "llama-3.1-70b-versatile" \
+        "llama-3.1-8b-instant" \
+        "mixtral-8x7b-32768"
+      ;;
+    4)
+      REMOTE_PROVIDER="mistral"
+      REMOTE_PROVIDER_NAME="Mistral AI"
+      REMOTE_BASE_URL="https://api.mistral.ai/v1"
+      _select_model_from_list \
+        "mistral-large-latest" \
+        "codestral-latest" \
+        "mistral-small-latest"
+      ;;
+    5)
+      REMOTE_PROVIDER="openrouter"
+      REMOTE_PROVIDER_NAME="OpenRouter"
+      REMOTE_BASE_URL="https://openrouter.ai/api/v1"
+      echo ""
+      echo -e "  ${CYAN}Exemplos de IDs de modelos no OpenRouter:${NC}"
+      echo -e "    ${DIM}anthropic/claude-sonnet-4-6    openai/gpt-4o${NC}"
+      echo -e "    ${DIM}google/gemini-2.0-flash         meta-llama/llama-3.3-70b-instruct${NC}"
+      echo -e "    ${DIM}qwen/qwen-2.5-coder-32b-instruct${NC}"
+      echo ""
+      read -r -p "  ID do modelo: " REMOTE_MODEL
+      [[ -z "$REMOTE_MODEL" ]] && { err "Modelo não pode ser vazio."; exit 1; }
+      log "Modelo: ${REMOTE_MODEL}"
+      ;;
+    6)
+      REMOTE_PROVIDER="together"
+      REMOTE_PROVIDER_NAME="Together AI"
+      REMOTE_BASE_URL="https://api.together.xyz/v1"
+      _select_model_from_list \
+        "meta-llama/Llama-3-70b-chat-hf" \
+        "meta-llama/Llama-3-8b-chat-hf" \
+        "Qwen/Qwen2.5-Coder-32B-Instruct" \
+        "mistralai/Mixtral-8x7B-Instruct-v0.1"
+      ;;
+    7)
+      REMOTE_PROVIDER="custom"
+      REMOTE_PROVIDER_NAME="Personalizado"
+      echo ""
+      read -r -p "  URL base da API (ex: https://meu-server.com/v1): " REMOTE_BASE_URL
+      [[ -z "$REMOTE_BASE_URL" ]] && { err "URL base não pode ser vazia."; exit 1; }
+      read -r -p "  Nome do modelo (ex: qwen2.5-coder:14b): " REMOTE_MODEL
+      [[ -z "$REMOTE_MODEL" ]] && { err "Modelo não pode ser vazio."; exit 1; }
+      log "Endpoint: ${REMOTE_BASE_URL} | Modelo: ${REMOTE_MODEL}"
+      ;;
+    *)
+      err "Opção inválida: '${choice}'. Execute o script novamente."
+      exit 1
+      ;;
+  esac
+
+  echo ""
+  echo -e "  ${BOLD}Cole sua chave de API para ${REMOTE_PROVIDER_NAME}:${NC}"
+  echo -e "  ${DIM}(a digitação ficará oculta por segurança — pressione Enter ao terminar)${NC}"
+  read -r -s -p "  API Key: " REMOTE_API_KEY
+  echo ""
+
+  [[ -z "$REMOTE_API_KEY" ]] && { err "Chave de API não pode ser vazia."; exit 1; }
+
+  _validate_remote_api
+
+  echo ""
+  echo -e "  ${BOLD}Resumo da configuração remota:${NC}"
+  echo -e "    Provedor:  ${CYAN}${REMOTE_PROVIDER_NAME}${NC}"
+  echo -e "    Modelo:    ${CYAN}${REMOTE_MODEL}${NC}"
+  echo -e "    Endpoint:  ${DIM}${REMOTE_BASE_URL}${NC}"
+  echo ""
+}
+
+###############################################################################
+# 1. DETECÇÃO DE DISTRIBUIÇÃO
+###############################################################################
+detect_distro() {
+  banner "Detectando distribuição Linux"
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck source=/dev/null
+    source /etc/os-release
+    case "${ID,,}" in
+      ubuntu|debian|linuxmint|pop)
+        DISTRO="debian"
+        PKG_MGR="apt-get"
+        ;;
+      fedora|rhel|centos|rocky|alma)
+        DISTRO="fedora"
+        PKG_MGR="dnf"
+        ;;
+      *)
+        # Tenta detecção por ID_LIKE
+        case "${ID_LIKE,,}" in
+          *debian*|*ubuntu*) DISTRO="debian"; PKG_MGR="apt-get" ;;
+          *fedora*|*rhel*)   DISTRO="fedora"; PKG_MGR="dnf"     ;;
+          *)
+            err "Distribuição '${ID}' não suportada automaticamente."
+            err "Suportadas: Ubuntu, Debian, Fedora, RHEL, CentOS, Rocky, Alma"
+            exit 1
+            ;;
+        esac
+        ;;
+    esac
+    log "Distribuição detectada: ${PRETTY_NAME:-$ID} (família: ${DISTRO})"
+  else
+    err "Não foi possível detectar a distribuição (/etc/os-release ausente)."
+    exit 1
+  fi
+}
+
+###############################################################################
+# 2. DETECÇÃO DE HARDWARE E SELEÇÃO INTELIGENTE DO MODELO
+###############################################################################
+detect_hardware() {
+  banner "Analisando hardware do sistema"
+
+  # ─── RAM ──────────────────────────────────────────────────────────────────
+  HW_RAM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+  log "RAM total: ${HW_RAM_GB} GB"
+
+  # ─── CPU ──────────────────────────────────────────────────────────────────
+  HW_CPU_CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+  HW_CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "Desconhecido")
+  log "CPU: ${HW_CPU_MODEL} (${HW_CPU_CORES} cores)"
+
+  # ─── GPU — NVIDIA ─────────────────────────────────────────────────────────
+  if command -v nvidia-smi &>/dev/null; then
+    HW_GPU_VENDOR="nvidia"
+    HW_GPU_MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | xargs || echo "NVIDIA desconhecida")
+    # VRAM em MB
+    HW_GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo 0)
+    log "GPU: ${HW_GPU_MODEL} (NVIDIA, ${HW_GPU_VRAM_MB} MB VRAM)"
+
+  # ─── GPU — AMD (ROCm) ────────────────────────────────────────────────────
+  elif command -v rocm-smi &>/dev/null; then
+    HW_GPU_VENDOR="amd"
+    HW_GPU_MODEL=$(rocm-smi --showproductname 2>/dev/null | grep -i "card" | head -1 | xargs || echo "AMD desconhecida")
+    HW_GPU_VRAM_MB=$(rocm-smi --showmeminfo vram 2>/dev/null | grep "Total" | awk '{print int($NF/1048576)}' | head -1 || echo 0)
+    if [[ "$HW_GPU_VRAM_MB" -eq 0 ]]; then
+      # Fallback: tenta via sysfs
+      local amd_vram_bytes
+      amd_vram_bytes=$(cat /sys/class/drm/card0/device/mem_info_vram_total 2>/dev/null || echo 0)
+      HW_GPU_VRAM_MB=$((amd_vram_bytes / 1048576))
+    fi
+    log "GPU: ${HW_GPU_MODEL} (AMD ROCm, ${HW_GPU_VRAM_MB} MB VRAM)"
+
+  # ─── GPU — Intel Arc (xe) ────────────────────────────────────────────────
+  elif [[ -d /sys/class/drm ]] && lspci 2>/dev/null | grep -iq "VGA.*Intel.*Arc"; then
+    HW_GPU_VENDOR="intel"
+    HW_GPU_MODEL=$(lspci 2>/dev/null | grep -i "VGA.*Intel" | head -1 | sed 's/.*: //' | xargs || echo "Intel Arc desconhecida")
+    # Intel Arc: VRAM estimada via lspci memory region
+    local intel_vram_bytes
+    intel_vram_bytes=$(cat /sys/class/drm/card0/device/mem_info_vram_total 2>/dev/null || echo 0)
+    HW_GPU_VRAM_MB=$((intel_vram_bytes / 1048576))
+    log "GPU: ${HW_GPU_MODEL} (Intel, ${HW_GPU_VRAM_MB} MB VRAM)"
+
+  # ─── GPU — Integrada / Nenhuma dedicada ───────────────────────────────────
+  else
+    HW_GPU_VENDOR="none"
+    local gpu_line
+    gpu_line=$(lspci 2>/dev/null | grep -i "VGA\|3D\|Display" | head -1 | sed 's/.*: //' || echo "Nenhuma detectada")
+    HW_GPU_MODEL="$gpu_line"
+    HW_GPU_VRAM_MB=0
+    log "GPU: ${HW_GPU_MODEL} (integrada/sem GPU dedicada)"
+  fi
+}
+
+select_model() {
+  banner "Selecionando modelo LLM ideal para o seu hardware"
+
+  local vram_gb=$((HW_GPU_VRAM_MB / 1024))
+
+  # ─── Classificação em tiers ───────────────────────────────────────────────
+  #
+  # A lógica prioriza VRAM da GPU (melhor indicador de capacidade para LLMs)
+  # e usa RAM como fallback para CPU-only inference.
+  #
+  # Tier       | Condição                              | Modelo
+  # -----------|---------------------------------------|---------------------------
+  # ultra      | VRAM ≥ 24 GB  OU  RAM ≥ 64 GB        | qwen2.5-coder:32b (maior coder disponível)
+  # high       | VRAM ≥ 12 GB  OU  RAM ≥ 32 GB        | qwen2.5-coder:14b
+  # mid        | VRAM ≥ 6 GB   OU  RAM ≥ 16 GB        | qwen2.5-coder:7b
+  # low        | VRAM ≥ 3 GB   OU  RAM ≥ 8 GB         | qwen2.5-coder:3b
+  # minimal    | Abaixo disso                          | qwen2.5-coder:1.5b
+  #
+  # Nota: qwen2.5-coder é treinado especificamente para código e tem suporte
+  # a tool-calling muito mais robusto que o qwen2.5 genérico.
+  #
+
+  if [[ "$HW_GPU_VENDOR" != "none" ]] && ((vram_gb >= 24)); then
+    HW_TIER="ultra"
+    OLLAMA_MODEL="qwen2.5-coder:32b"
+    HW_MODEL_REASON="GPU ${HW_GPU_MODEL} com ${vram_gb} GB VRAM — modelo coder 32B (máximo disponível na série coder)"
+
+  elif [[ "$HW_GPU_VENDOR" != "none" ]] && ((vram_gb >= 12)); then
+    HW_TIER="high"
+    OLLAMA_MODEL="qwen2.5-coder:14b"
+    HW_MODEL_REASON="GPU ${HW_GPU_MODEL} com ${vram_gb} GB VRAM suporta o modelo coder 14B"
+
+  elif [[ "$HW_GPU_VENDOR" != "none" ]] && ((vram_gb >= 6)); then
+    HW_TIER="mid"
+    OLLAMA_MODEL="qwen2.5-coder:7b"
+    HW_MODEL_REASON="GPU ${HW_GPU_MODEL} com ${vram_gb} GB VRAM suporta o modelo coder 7B"
+
+  elif [[ "$HW_GPU_VENDOR" != "none" ]] && ((vram_gb >= 3)); then
+    HW_TIER="low"
+    OLLAMA_MODEL="qwen2.5-coder:3b"
+    HW_MODEL_REASON="GPU ${HW_GPU_MODEL} com ${vram_gb} GB VRAM suporta o modelo coder 3B"
+
+  # ─── Fallback: sem GPU dedicada, usa RAM para CPU inference ───────────────
+  elif ((HW_RAM_GB >= 64)); then
+    HW_TIER="ultra"
+    OLLAMA_MODEL="qwen2.5-coder:32b"
+    HW_MODEL_REASON="${HW_RAM_GB} GB RAM permite rodar o modelo coder 32B via CPU (mais lento que GPU)"
+
+  elif ((HW_RAM_GB >= 32)); then
+    HW_TIER="high"
+    OLLAMA_MODEL="qwen2.5-coder:14b"
+    HW_MODEL_REASON="${HW_RAM_GB} GB RAM suporta o modelo coder 14B via CPU"
+
+  elif ((HW_RAM_GB >= 16)); then
+    HW_TIER="mid"
+    OLLAMA_MODEL="qwen2.5-coder:7b"
+    HW_MODEL_REASON="${HW_RAM_GB} GB RAM suporta o modelo coder 7B via CPU"
+
+  elif ((HW_RAM_GB >= 8)); then
+    HW_TIER="low"
+    OLLAMA_MODEL="qwen2.5-coder:3b"
+    HW_MODEL_REASON="${HW_RAM_GB} GB RAM suporta o modelo coder 3B via CPU"
+
+  else
+    HW_TIER="minimal"
+    OLLAMA_MODEL="qwen2.5-coder:1.5b"
+    HW_MODEL_REASON="Hardware limitado (${HW_RAM_GB} GB RAM) — usando modelo coder ultra-leve 1.5B"
+  fi
+
+  # ─── Ajuste por CPU: se tem muitos cores, pode compensar falta de GPU ────
+  if [[ "$HW_GPU_VENDOR" == "none" ]] && ((HW_CPU_CORES >= 16)) && [[ "$HW_TIER" != "ultra" ]]; then
+    case "$HW_TIER" in
+      minimal)
+        if ((HW_RAM_GB >= 6)); then
+          HW_TIER="low"
+          OLLAMA_MODEL="qwen2.5-coder:3b"
+          HW_MODEL_REASON="${HW_MODEL_REASON} + CPU forte (${HW_CPU_CORES} cores) compensa falta de GPU"
+        fi
+        ;;
+      low)
+        if ((HW_RAM_GB >= 12)); then
+          HW_TIER="mid"
+          OLLAMA_MODEL="qwen2.5-coder:7b"
+          HW_MODEL_REASON="${HW_MODEL_REASON} + CPU forte (${HW_CPU_CORES} cores) permite subir um tier"
+        fi
+        ;;
+      mid)
+        if ((HW_RAM_GB >= 24)); then
+          HW_TIER="high"
+          OLLAMA_MODEL="qwen2.5-coder:14b"
+          HW_MODEL_REASON="${HW_MODEL_REASON} + CPU forte (${HW_CPU_CORES} cores) permite subir um tier"
+        fi
+        ;;
+    esac
+  fi
+
+  # ─── Exibe resultado ─────────────────────────────────────────────────────
+  echo ""
+  echo -e "  ${BOLD}╭─────────────────────────────────────────────────────────────╮${NC}"
+  echo -e "  ${BOLD}│          PERFIL DE HARDWARE DETECTADO                       │${NC}"
+  echo -e "  ${BOLD}├─────────────────────────────────────────────────────────────┤${NC}"
+  printf   "  ${BOLD}│${NC} %-14s %-44s ${BOLD}│${NC}\n" "RAM:" "${HW_RAM_GB} GB"
+  printf   "  ${BOLD}│${NC} %-14s %-44s ${BOLD}│${NC}\n" "CPU:" "${HW_CPU_MODEL}"
+  printf   "  ${BOLD}│${NC} %-14s %-44s ${BOLD}│${NC}\n" "CPU Cores:" "${HW_CPU_CORES}"
+  printf   "  ${BOLD}│${NC} %-14s %-44s ${BOLD}│${NC}\n" "GPU:" "${HW_GPU_MODEL}"
+  if [[ "$HW_GPU_VENDOR" != "none" ]]; then
+    printf "  ${BOLD}│${NC} %-14s %-44s ${BOLD}│${NC}\n" "VRAM:" "$((HW_GPU_VRAM_MB / 1024)) GB (${HW_GPU_VRAM_MB} MB)"
+    printf "  ${BOLD}│${NC} %-14s %-44s ${BOLD}│${NC}\n" "Driver:" "${HW_GPU_VENDOR^^}"
+  fi
+  echo -e "  ${BOLD}├─────────────────────────────────────────────────────────────┤${NC}"
+  printf   "  ${BOLD}│${NC} %-14s ${GREEN}%-44s${NC} ${BOLD}│${NC}\n" "Tier:" "${HW_TIER^^}"
+  printf   "  ${BOLD}│${NC} %-14s ${CYAN}%-44s${NC} ${BOLD}│${NC}\n" "Modelo:" "${OLLAMA_MODEL}"
+  echo -e "  ${BOLD}├─────────────────────────────────────────────────────────────┤${NC}"
+  echo -e "  ${BOLD}│${NC} ${YELLOW}Razão:${NC}"
+  # Quebra a razão em linhas de ~56 caracteres
+  echo "$HW_MODEL_REASON" | fold -s -w 56 | while IFS= read -r line; do
+    printf "  ${BOLD}│${NC}   %-56s ${BOLD}│${NC}\n" "$line"
+  done
+  echo -e "  ${BOLD}╰─────────────────────────────────────────────────────────────╯${NC}"
+  echo ""
+
+  log "Modelo selecionado: ${OLLAMA_MODEL} (tier: ${HW_TIER})"
+
+  # ─── Define janela de contexto por tier ──────────────────────────────────
+  # O padrão do Ollama é 2048, insuficiente para os prompts do sistema dos
+  # agentes. Usar valores maiores garante que as instruções não sejam truncadas.
+  case "$HW_TIER" in
+    ultra)   OLLAMA_NUM_CTX=32768 ;;
+    high)    OLLAMA_NUM_CTX=16384 ;;
+    mid)     OLLAMA_NUM_CTX=8192  ;;
+    low)     OLLAMA_NUM_CTX=4096  ;;
+    minimal) OLLAMA_NUM_CTX=4096  ;;
+    *)       OLLAMA_NUM_CTX=4096  ;;
+  esac
+  log "Janela de contexto (num_ctx): ${OLLAMA_NUM_CTX} tokens"
+
+  # ─── Aviso para tiers baixos ──────────────────────────────────────────────
+  if [[ "$HW_TIER" == "minimal" ]]; then
+    warn "Hardware muito limitado detectado. O modelo 1.5B é funcional mas"
+    warn "terá respostas mais curtas e menos precisas. Considere adicionar"
+    warn "mais RAM ou uma GPU dedicada para melhorar a experiência."
+  elif [[ "$HW_TIER" == "low" ]] && [[ "$HW_GPU_VENDOR" == "none" ]]; then
+    warn "Rodando via CPU sem GPU dedicada. A inferência será mais lenta."
+    warn "Uma GPU com 4+ GB VRAM melhoraria significativamente a velocidade."
+  fi
+}
+
+###############################################################################
+# 3. VERIFICAÇÃO E RESOLUÇÃO DE CONFLITOS DE PORTA
+###############################################################################
+check_port() {
+  local port=$1
+  local service_name=$2
+  if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+    local pid
+    pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -oP 'pid=\K[0-9]+' | head -1)
+    local proc_name
+    proc_name=$(ps -p "${pid}" -o comm= 2>/dev/null || echo "desconhecido")
+    warn "Porta ${port} (${service_name}) já em uso por '${proc_name}' (PID ${pid})"
+    return 1
+  fi
+  return 0
+}
+
+find_free_port() {
+  local base_port=$1
+  local port=$base_port
+  while ss -tlnp 2>/dev/null | grep -q ":${port} "; do
+    port=$((port + 1))
+    if ((port > base_port + 100)); then
+      err "Não foi possível encontrar porta livre próxima de ${base_port}"
+      exit 1
+    fi
+  done
+  echo "$port"
+}
+
+resolve_ports() {
+  banner "Verificando conflitos de porta"
+
+  if ! check_port "$OLLAMA_PORT" "Ollama"; then
+    warn "Ollama pode já estar rodando — será reutilizado."
+  fi
+
+  if ! check_port "$GATEWAY_PORT" "OpenClaw Gateway"; then
+    GATEWAY_PORT=$(find_free_port "$GATEWAY_PORT")
+    warn "Porta do Gateway realocada para: ${GATEWAY_PORT}"
+  else
+    log "Porta ${GATEWAY_PORT} (Gateway) livre."
+  fi
+
+}
+
+###############################################################################
+# 4. INSTALAÇÃO DE DEPENDÊNCIAS DO SISTEMA
+###############################################################################
+install_system_deps() {
+  banner "Instalando dependências do sistema"
+
+  if [[ "$DISTRO" == "debian" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq \
+      curl wget git jq ca-certificates gnupg lsb-release \
+      software-properties-common apt-transport-https \
+      net-tools procps iproute2 sudo
+  elif [[ "$DISTRO" == "fedora" ]]; then
+    dnf install -y -q \
+      curl wget git jq ca-certificates gnupg2 \
+      net-tools procps-ng iproute policycoreutils-python-utils \
+      sudo dnf-plugins-core
+  fi
+  log "Dependências do sistema instaladas."
+}
+
+###############################################################################
+# 5. INSTALAÇÃO DO NODE.JS (≥ 20)
+###############################################################################
+install_nodejs() {
+  banner "Instalando Node.js"
+
+  local need_install=true
+  if command -v node &>/dev/null; then
+    local node_major
+    node_major=$(node -v | sed 's/v//' | cut -d. -f1)
+    if ((node_major >= 20)); then
+      log "Node.js já instalado: $(node -v)"
+      need_install=false
+    else
+      warn "Node.js ${node_major} muito antigo. Instalando v20+."
+    fi
+  fi
+
+  if $need_install; then
+    if [[ "$DISTRO" == "debian" ]]; then
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+      apt-get install -y -qq nodejs
+    elif [[ "$DISTRO" == "fedora" ]]; then
+      curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+      dnf install -y -q nodejs
+    fi
+    log "Node.js instalado: $(node -v)"
+  fi
+}
+
+###############################################################################
+# 7. INSTALAÇÃO DO OLLAMA + MODELO LOCAL
+###############################################################################
+install_ollama() {
+  banner "Instalando Ollama + modelo ${OLLAMA_MODEL}"
+
+  if command -v ollama &>/dev/null; then
+    log "Ollama já instalado: $(ollama --version 2>/dev/null || echo 'versão desconhecida')"
+  else
+    info "Baixando e instalando Ollama..."
+    # Cria home dir e .ollama com permissões corretas para o usuário ollama
+    mkdir -p /usr/share/ollama/.ollama
+    # Cria usuário ollama previamente se não existir (evita warning do useradd)
+    if ! id "ollama" &>/dev/null; then
+      useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama 2>/dev/null || true
+    fi
+    chown -R ollama:ollama /usr/share/ollama
+    curl -fsSL https://ollama.com/install.sh | sh 2>&1 | grep -v "warning: the home directory\|Not copying any file" || true
+    # Garante permissões após o instalador (ele pode ter recriado diretórios)
+    chown -R ollama:ollama /usr/share/ollama
+    log "Ollama instalado com sucesso."
+  fi
+
+  # Garante que existe um unit file systemd para o Ollama
+  # O instalador oficial do Ollama às vezes falha em criar o serviço
+  if ! systemctl list-unit-files ollama.service &>/dev/null || \
+     ! systemctl list-unit-files ollama.service 2>/dev/null | grep -q "ollama"; then
+    info "Criando unit file systemd para Ollama..."
+    cat > /etc/systemd/system/ollama.service <<'OLLAMASVCEOF'
+[Unit]
+Description=Ollama LLM Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ollama serve
+Restart=on-failure
+RestartSec=5
+Environment="HOME=/usr/share/ollama"
+Environment="OLLAMA_HOST=0.0.0.0"
+WorkingDirectory=/usr/share/ollama
+
+[Install]
+WantedBy=multi-user.target
+OLLAMASVCEOF
+    systemctl daemon-reload
+    log "Unit file do Ollama criado em /etc/systemd/system/ollama.service"
+  fi
+
+  # Garante que o serviço Ollama está ativo
+  if systemctl is-active --quiet ollama 2>/dev/null; then
+    log "Serviço Ollama já está ativo."
+  else
+    systemctl enable --now ollama 2>/dev/null || {
+      info "Iniciando Ollama manualmente em segundo plano..."
+      su - "$REAL_USER" -c "ollama serve &" 2>/dev/null || ollama serve &
+      sleep 3
+    }
+    log "Serviço Ollama ativo."
+  fi
+
+  # Aguarda API ficar disponível (pode demorar na primeira inicialização)
+  info "Aguardando API do Ollama ficar disponível..."
+  local retries=0
+  local max_retries=90
+  while ! curl -sf http://localhost:${OLLAMA_PORT}/api/tags >/dev/null 2>&1; do
+    retries=$((retries + 1))
+    if ((retries > max_retries)); then
+      warn "Ollama não respondeu em ${max_retries} segundos. Diagnóstico:"
+      warn "  Status do serviço: $(systemctl is-active ollama 2>/dev/null || echo 'desconhecido')"
+      warn "  Porta ${OLLAMA_PORT}: $(ss -tlnp 2>/dev/null | grep ":${OLLAMA_PORT}" || echo 'não encontrada')"
+      warn "  Últimas linhas do log:"
+      journalctl -u ollama --no-pager -n 10 2>/dev/null || true
+      # Tenta reiniciar o serviço uma vez antes de desistir
+      info "Tentando reiniciar o serviço Ollama..."
+      systemctl restart ollama 2>/dev/null || true
+      local retry2=0
+      while ! curl -sf http://localhost:${OLLAMA_PORT}/api/tags >/dev/null 2>&1; do
+        retry2=$((retry2 + 1))
+        if ((retry2 > 30)); then
+          err "Ollama não respondeu após reinicialização. Verifique: journalctl -u ollama -n 50"
+          exit 1
+        fi
+        sleep 1
+      done
+      break
+    fi
+    # Mostra progresso a cada 15 segundos
+    if ((retries % 15 == 0)); then
+      info "Ainda aguardando Ollama... (${retries}/${max_retries}s)"
+    fi
+    sleep 1
+  done
+  log "API do Ollama disponível na porta ${OLLAMA_PORT}."
+
+  # Baixa o modelo se não existir
+  if ollama list 2>/dev/null | grep -q "${OLLAMA_MODEL%%:*}" 2>/dev/null; then
+    log "Modelo ${OLLAMA_MODEL} já disponível."
+  else
+    info "Baixando modelo ${OLLAMA_MODEL} (pode levar alguns minutos)..."
+    info "Tamanho do download depende do modelo. Aguarde..."
+    if ! ollama pull "$OLLAMA_MODEL"; then
+      err "Falha ao baixar o modelo ${OLLAMA_MODEL}."
+      err "Verifique sua conexão de internet e tente: ollama pull ${OLLAMA_MODEL}"
+      exit 1
+    fi
+    log "Modelo ${OLLAMA_MODEL} baixado com sucesso."
+  fi
+
+  # Verifica se o modelo realmente está disponível
+  if ! ollama list 2>/dev/null | grep -q "${OLLAMA_MODEL%%:*}" 2>/dev/null; then
+    err "Modelo ${OLLAMA_MODEL} não aparece na lista do Ollama após download."
+    err "Tente manualmente: ollama pull ${OLLAMA_MODEL}"
+    exit 1
+  fi
+  log "Modelo ${OLLAMA_MODEL} verificado e pronto para uso."
+}
+
+###############################################################################
+# 8. CONFIGURAÇÃO DO OLLAMA (rede + limites de recursos)
+###############################################################################
+configure_ollama_network() {
+  banner "Configurando Ollama (rede + limites de recursos)"
+
+  # ─── Calcula limites de recursos proporcionais ao hardware ─────────────
+  # Reserva no máximo ~40% da RAM total para o Ollama
+  local total_ram_mb=$((HW_RAM_GB * 1024))
+  local ollama_ram_limit_mb=$((total_ram_mb * 3 / 8))
+  ((ollama_ram_limit_mb < 1024)) && ollama_ram_limit_mb=1024
+
+  # CPU: metade dos cores totais, 75% desse budget para Ollama
+  local cpu_budget=$(( HW_CPU_CORES * 50 ))
+  local ollama_cpu_quota=$(( cpu_budget * 3 / 4 ))
+  ((ollama_cpu_quota < 100)) && ollama_cpu_quota=100
+
+  info "Limites de recursos para Ollama: ${ollama_ram_limit_mb}M RAM, ${ollama_cpu_quota}% CPU"
+
+  mkdir -p /etc/systemd/system/ollama.service.d
+  cat > /etc/systemd/system/ollama.service.d/override.conf <<OLLAMAEOF
+[Service]
+# Aceita conexões de qualquer interface (acesso pela rede local)
+Environment="OLLAMA_HOST=0.0.0.0"
+# Descarrega modelo da memória após 5 min sem uso (libera RAM/VRAM)
+Environment="OLLAMA_KEEP_ALIVE=5m"
+# Limita inferências paralelas para economizar recursos
+Environment="OLLAMA_NUM_PARALLEL=1"
+# Janela de contexto padrão — o default de 2048 trunca os system prompts dos agentes
+Environment="OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX}"
+
+# ─── Limites de recursos via systemd (cgroup) ──────────────────────
+MemoryMax=${ollama_ram_limit_mb}M
+MemoryHigh=$(( ollama_ram_limit_mb * 80 / 100 ))M
+CPUQuota=${ollama_cpu_quota}%
+
+# Prioridade I/O mais baixa para não bloquear disco de outros serviços
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# Nice +5 = prioridade menor que processos normais
+Nice=5
+OLLAMAEOF
+
+  # Salva limites para uso pelo start_openclaw e print_summary
+  echo "${ollama_ram_limit_mb}" > "${OPENCLAW_CONFIG_DIR}/.ollama_ram_limit"
+  echo "${ollama_cpu_quota}" > "${OPENCLAW_CONFIG_DIR}/.ollama_cpu_quota"
+
+  systemctl daemon-reload
+  systemctl restart ollama 2>/dev/null || true
+
+  # Aguarda reinício
+  local retries=0
+  while ! curl -sf http://localhost:${OLLAMA_PORT}/api/tags >/dev/null 2>&1; do
+    retries=$((retries + 1))
+    if ((retries > 60)); then
+      warn "Ollama demorou para reiniciar; continuando mesmo assim."
+      break
+    fi
+    sleep 1
+  done
+  log "Ollama escutando em 0.0.0.0:${OLLAMA_PORT} (com limites de recursos)"
+}
+
+###############################################################################
+# 9. INSTALAÇÃO DO OPENCLAW via npm
+###############################################################################
+install_openclaw() {
+  banner "Instalando OpenClaw via npm"
+
+  # Cria diretórios necessários
+  mkdir -p "$OPENCLAW_CONFIG_DIR" "$OPENCLAW_WORKSPACE_DIR"
+  chown -R "$REAL_USER":"$REAL_USER" "$OPENCLAW_CONFIG_DIR"
+
+  # Para o serviço do gateway se estiver rodando (evita travar o npm update)
+  systemctl stop openclaw-gateway 2>/dev/null || true
+
+  # Instala ou atualiza o pacote npm global
+  if command -v openclaw &>/dev/null; then
+    local current_ver
+    current_ver=$(openclaw --version 2>/dev/null || echo "desconhecida")
+
+    # Verifica se já está na versão mais recente
+    local latest_ver
+    latest_ver=$(npm view openclaw version 2>/dev/null || echo "")
+    if [[ -n "$latest_ver" && "$current_ver" == "$latest_ver" ]]; then
+      log "OpenClaw já está na versão mais recente (v${current_ver}). Pulando update."
+    else
+      info "OpenClaw instalado (v${current_ver}). Atualizando para latest..."
+      # Timeout de 120s para evitar que trave indefinidamente
+      if timeout 120 npm install -g openclaw@latest --loglevel=error 2>&1; then
+        log "OpenClaw atualizado com sucesso."
+      else
+        warn "npm install travou ou falhou (timeout 120s). Usando versão atual: ${current_ver}"
+      fi
+    fi
+  else
+    info "Instalando OpenClaw via npm (openclaw@latest)..."
+    if ! timeout 180 npm install -g openclaw@latest --loglevel=error 2>&1; then
+      err "Falha ao instalar OpenClaw via npm (timeout 180s)."
+      err "Tente manualmente: npm install -g openclaw@latest"
+      exit 1
+    fi
+  fi
+
+  # Verifica que o binário está disponível
+  if ! command -v openclaw &>/dev/null; then
+    # npm global pode estar fora do PATH quando rodando como root com sudo
+    local npm_global_bin
+    npm_global_bin=$(npm root -g 2>/dev/null | sed 's|/lib/node_modules||')"/bin"
+    if [[ -f "${npm_global_bin}/openclaw" ]]; then
+      ln -sf "${npm_global_bin}/openclaw" /usr/local/bin/openclaw
+      log "Symlink criado: /usr/local/bin/openclaw -> ${npm_global_bin}/openclaw"
+    else
+      err "Binário 'openclaw' não encontrado após instalação npm."
+      err "Tente manualmente: npm install -g openclaw@latest"
+      exit 1
+    fi
+  fi
+
+  log "OpenClaw instalado: $(openclaw --version 2>/dev/null || echo 'ok')"
+}
+
+###############################################################################
+# 10. GERAÇÃO DE TOKEN + CONFIGURAÇÃO DO OPENCLAW
+###############################################################################
+generate_config() {
+  banner "Gerando configuração do OpenClaw"
+
+  # Gera token seguro
+  local GW_TOKEN
+  GW_TOKEN=$(openssl rand -hex 32)
+
+  # ─── Monta o bloco de modelos e a referência primária ────────────────────
+  # Este bloco varia conforme o modo de instalação (local = Ollama, remote = API).
+  local MODELS_BLOCK PRIMARY_MODEL_REF
+
+  if [[ "$INSTALL_MODE" == "remote" ]]; then
+    PRIMARY_MODEL_REF="${REMOTE_PROVIDER}/${REMOTE_MODEL}"
+    MODELS_BLOCK="$(printf \
+      '"models": {\n    "providers": {\n      "%s": {\n        "baseUrl": "%s",\n        "apiKey": "%s",\n        "api": "openai-completions",\n        "models": [\n          {\n            "id": "%s",\n            "name": "%s"\n          }\n        ]\n      }\n    }\n  }' \
+      "${REMOTE_PROVIDER}" "${REMOTE_BASE_URL}" "${REMOTE_API_KEY}" \
+      "${REMOTE_MODEL}" "${REMOTE_MODEL}")"
+  else
+    # Modo local: Ollama rodando na própria máquina
+    PRIMARY_MODEL_REF="ollama/${OLLAMA_MODEL}"
+    MODELS_BLOCK="$(printf \
+      '"models": {\n    "providers": {\n      "ollama": {\n        "baseUrl": "http://127.0.0.1:%d/v1",\n        "apiKey": "ollama-local",\n        "api": "openai-completions",\n        "models": [\n          {\n            "id": "%s",\n            "name": "%s",\n            "options": {\n              "num_ctx": %d\n            }\n          }\n        ]\n      }\n    }\n  }' \
+      "${OLLAMA_PORT}" "${OLLAMA_MODEL}" "${OLLAMA_MODEL}" "${OLLAMA_NUM_CTX}")"
+  fi
+
+  # Detecta IP privado (LAN) e público (VPS/internet)
+  local LOCAL_IP
+  LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  LOCAL_IP="${LOCAL_IP:-127.0.0.1}"
+
+  local PUBLIC_IP=""
+  PUBLIC_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
+           || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null \
+           || curl -sf --max-time 5 https://icanhazip.com 2>/dev/null \
+           || echo "")
+  # Remove espaços/newlines
+  PUBLIC_IP=$(echo "$PUBLIC_IP" | tr -d '[:space:]')
+
+  # Cria arquivo de configuração principal
+  cat > "${OPENCLAW_CONFIG_DIR}/openclaw.json" <<JSONEOF
+{
+  "gateway": {
+    "port": ${GATEWAY_PORT},
+    "mode": "local",
+    "bind": "lan",
+    "auth": {
+      "mode": "token",
+      "token": "${GW_TOKEN}"
+    },
+    "controlUi": {
+      "enabled": true,
+      "basePath": "/",
+      "allowedOrigins": ["*"],
+      "allowInsecureAuth": true,
+      "dangerouslyDisableDeviceAuth": true
+    }
+  },
+  ${MODELS_BLOCK},
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "${PRIMARY_MODEL_REF}"
+      },
+      "memorySearch": {
+        "enabled": false
+      },
+      "subagents": {
+        "maxSpawnDepth": 2,
+        "maxConcurrent": 4,
+        "maxChildrenPerAgent": 3
+      }
+    },
+    "list": [
+      {
+        "id": "manager",
+        "name": "Manager",
+        "default": true,
+        "identity": {
+          "emoji": "📋",
+          "theme": "blue"
+        },
+        "subagents": {
+          "allowAgents": ["backend", "frontend", "qa"]
+        }
+      },
+      {
+        "id": "backend",
+        "name": "Backend Dev",
+        "identity": {
+          "emoji": "⚙️",
+          "theme": "green"
+        },
+        "subagents": {
+          "allowAgents": ["manager", "frontend", "qa"]
+        }
+      },
+      {
+        "id": "frontend",
+        "name": "Frontend Dev",
+        "identity": {
+          "emoji": "🎨",
+          "theme": "purple"
+        },
+        "subagents": {
+          "allowAgents": ["manager", "backend", "qa"]
+        }
+      },
+      {
+        "id": "qa",
+        "name": "QA Engineer",
+        "identity": {
+          "emoji": "🧪",
+          "theme": "orange"
+        },
+        "subagents": {
+          "allowAgents": ["manager", "backend", "frontend"]
+        }
+      }
+    ]
+  },
+  "tools": {
+    "agentToAgent": {
+      "enabled": true,
+      "allow": ["manager", "backend", "frontend", "qa"]
+    },
+    "sessions": {
+      "visibility": "all"
+    }
+  }
+}
+JSONEOF
+
+  log "Configuração principal gravada em ${OPENCLAW_CONFIG_DIR}/openclaw.json"
+
+  # ─── Valida a configuração e aplica migrações automáticas se necessário ──
+  local OPENCLAW_BIN
+  OPENCLAW_BIN=$(command -v openclaw 2>/dev/null || echo "")
+  if [[ -n "$OPENCLAW_BIN" && -x "$OPENCLAW_BIN" ]]; then
+    log "Validando configuração com 'openclaw doctor'..."
+    # Passa HOME correto para que o doctor encontre ~/.openclaw/openclaw.json
+    if ! HOME="$REAL_HOME" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_DIR}/openclaw.json" \
+        "$OPENCLAW_BIN" doctor 2>/dev/null; then
+      warn "Configuração precisa de ajustes. Executando 'openclaw doctor --fix'..."
+      HOME="$REAL_HOME" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_DIR}/openclaw.json" \
+        "$OPENCLAW_BIN" doctor --fix 2>/dev/null || true
+    fi
+  fi
+
+  # ─── Cria workspaces completos para cada agente ──────────────────────────
+  # OpenClaw espera arquivos em ~/.openclaw/workspace-<agentId>/
+  # O agente default (manager) usa ~/.openclaw/workspace/
+
+  local ws_base="${OPENCLAW_CONFIG_DIR}"
+
+  # ─── Função auxiliar: cria arquivos padrão do workspace ─────────────────
+  create_workspace_files() {
+    local ws_dir="$1"
+    local agent_id="$2"
+    local agent_name="$3"
+    local agent_emoji="$4"
+    local agent_theme="$5"
+    local soul_content="$6"
+    local agents_content="$7"
+
+    mkdir -p "${ws_dir}" "${ws_dir}/memory"
+
+    # SOUL.md — Persona do agente (conteúdo passado como parâmetro)
+    cat > "${ws_dir}/SOUL.md" <<SOULEOF
+${soul_content}
+SOULEOF
+
+    # AGENTS.md — Instruções operacionais (conteúdo passado como parâmetro)
+    cat > "${ws_dir}/AGENTS.md" <<AGENTSEOF
+${agents_content}
+AGENTSEOF
+
+    # IDENTITY.md — Identidade visual
+    cat > "${ws_dir}/IDENTITY.md" <<IDEOF
+# Identity
+
+- **Name**: ${agent_name}
+- **Creature**: AI Assistant
+- **Vibe**: Professional, focused, collaborative
+- **Emoji**: ${agent_emoji}
+- **Theme**: ${agent_theme}
+IDEOF
+
+    # USER.md — Perfil do usuário
+    cat > "${ws_dir}/USER.md" <<USEREOF
+# User Profile
+
+- **Name**: (auto-detected on first interaction)
+- **Pronouns**: (not specified)
+- **Timezone**: $(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
+- **Notes**: Installed via openclaw-fullstack-installer
+- **Context**: User wants a multi-agent dev team that can build full projects autonomously
+USEREOF
+
+    # TOOLS.md — Ferramentas do ambiente (com regras de segurança)
+    # O conteúdo varia conforme o modo de instalação
+    local llm_backend_line
+    if [[ "${INSTALL_MODE}" == "remote" ]]; then
+      llm_backend_line="- **LLM Backend**: ${REMOTE_PROVIDER_NAME} (remote API) — model: ${REMOTE_MODEL}"$'\n'"- **API Endpoint**: ${REMOTE_BASE_URL}"
+    else
+      llm_backend_line="- **LLM Backend**: Ollama (local) — model: ${OLLAMA_MODEL} (qwen2.5-coder, especializado em código)"$'\n'"- **Ollama API**: http://127.0.0.1:${OLLAMA_PORT}"$'\n'"- **Context Window**: ${OLLAMA_NUM_CTX} tokens"
+    fi
+
+    cat > "${ws_dir}/TOOLS.md" <<TOOLSEOF
+# Tools & Environment
+
+## Local Environment
+- **OS**: $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "Linux")
+${llm_backend_line}
+- **Working Directory**: The user's project directory (check with \`pwd\`)
+
+## CRITICAL RULES FOR TOOL USAGE
+
+### File Operations
+- ALWAYS use absolute paths starting with / or ~
+- Before creating files, verify the target directory exists
+- Use \`mkdir -p\` before writing to new directories
+
+### Web / URL Rules
+- NEVER call web_fetch or any URL tool unless you have a COMPLETE, VALID URL starting with http:// or https://
+- Do NOT guess or fabricate URLs — if you don't know the exact URL, skip it
+- If a task requires web access and you don't have the URL, ask the user
+- For documentation, use your training knowledge instead of fetching URLs
+
+### Shell Commands
+- Prefer simple, well-known commands
+- Always quote paths with spaces
+- Check command existence before using: \`command -v <tool>\`
+- For package installs, detect the package manager first (apt, dnf, pacman, etc.)
+
+## Available Tools on This System
+- **Node.js / npm**: For JavaScript/TypeScript projects
+- **Python / pip**: For Python projects
+- **Git**: Version control
+- **Docker**: Container management (if installed)
+- **curl**: HTTP requests (use this instead of web_fetch for API testing)
+
+## Notes
+Add environment-specific notes here (SSH hosts, database URLs, API keys, etc.)
+TOOLSEOF
+
+    # HEARTBEAT.md — Tarefas periódicas (vazio por padrão)
+    cat > "${ws_dir}/HEARTBEAT.md" <<'HBEOF'
+# Heartbeat Tasks
+
+<!-- Keep this file empty to skip heartbeat API calls. -->
+<!-- Add small periodic tasks below only when needed. -->
+HBEOF
+
+    # BOOTSTRAP.md — Ritual de primeiro uso
+    cat > "${ws_dir}/BOOTSTRAP.md" <<BSEOF
+# Bootstrap — First Run
+
+Welcome! This is the first time **${agent_name}** (${agent_emoji}) is running.
+
+## Setup Steps
+1. Read SOUL.md carefully — it defines WHO you are and HOW you work
+2. Read AGENTS.md — it defines your operating procedures and team coordination
+3. Read TOOLS.md — it defines what tools are available and their rules
+4. Read USER.md — it tells you about the user
+5. Introduce yourself briefly to the user
+6. Ask what project they'd like to work on
+
+After your first successful interaction, delete this file.
+BSEOF
+
+    # MEMORY.md — Memória de longo prazo (arquivo inicial)
+    cat > "${ws_dir}/MEMORY.md" <<MEMEOF
+# ${agent_name} — Long-Term Memory
+
+## Active Projects
+(none yet)
+
+## Key Decisions
+(none yet)
+
+## User Preferences
+(discovered during interactions)
+
+---
+*This file is maintained automatically. Add important context that should persist across sessions.*
+MEMEOF
+  }
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # MANAGER AGENT — Orquestrador principal
+  # ═══════════════════════════════════════════════════════════════════════════
+  create_workspace_files "${ws_base}/workspace" "manager" "Manager" "📋" "blue" \
+'# Manager Agent — Project Orchestrator
+
+_You are not a chatbot. You are the lead Project Manager of a 4-agent software development team._
+
+## WHO YOU ARE
+You are the ONLY agent the user talks to directly. You receive project requests and orchestrate the entire team to deliver working software. You do NOT write code yourself — you delegate to specialists.
+
+## YOUR TEAM
+| Agent ID   | Role            | When to Use |
+|-----------|-----------------|-------------|
+| @backend  | Backend Dev     | APIs, databases, server logic, auth, integrations, CLI tools |
+| @frontend | Frontend Dev    | UI/UX, web pages, components, styling, client-side logic |
+| @qa       | QA Engineer     | Testing, bug verification, quality checks, code review |
+
+## HOW TO DELEGATE TASKS
+
+When you receive a project request, follow this EXACT process:
+
+### Step 1: Analyze & Plan
+- Break the request into concrete, specific tasks
+- Identify which agent handles each task
+- Determine task dependencies (what must finish before what starts)
+- Create a clear task list with priorities
+
+### Step 2: Delegate Using Session Tools
+To send work to another agent, use the `sessions_spawn` tool:
+```
+Tool: sessions_spawn
+Parameters:
+  agentId: "backend"  (or "frontend" or "qa")
+  message: "<DETAILED task description with ALL context needed>"
+```
+
+CRITICAL: When delegating, your message MUST include:
+- Exactly what to build (specific files, functions, endpoints)
+- Technical requirements (language, framework, structure)
+- Where to create files (directory path)
+- Acceptance criteria (what "done" looks like)
+- Any context from other agents work they need to know about
+
+### Step 3: Coordinate & Integrate
+- After backend finishes APIs, tell frontend the exact endpoints and data shapes
+- After frontend finishes UI, tell QA what to test and how
+- Resolve any conflicts or questions between agents
+- Ensure all pieces work together
+
+### Step 4: Verify & Deliver
+- Ask QA to run final verification
+- Compile the final status for the user
+- Report what was built, where files are, and how to run it
+
+## DELEGATION RULES
+1. NEVER write code yourself — always delegate to the appropriate specialist
+2. NEVER give vague instructions — be specific about files, paths, technologies
+3. ALWAYS provide full context — agents cannot see each other'"'"'s conversations
+4. When delegating frontend work that depends on backend, WAIT for backend to finish first, then include the API details in the frontend task
+5. For simple projects (like a hello world page), you can delegate to just one agent
+6. For complex projects, create a phased plan and execute it step by step
+
+## EXAMPLE: User asks "build me a todo app"
+
+Your plan should be:
+1. Delegate to @backend: "Create a REST API with Express.js at ~/projects/todo-app/server/ with endpoints: GET /todos, POST /todos, PUT /todos/:id, DELETE /todos/:id. Use an in-memory array for storage. Include CORS middleware. Listen on port 3001."
+2. WAIT for backend to finish, then delegate to @frontend: "Create a React app at ~/projects/todo-app/client/ that connects to the API at http://localhost:3001. Build components: TodoList, TodoItem, AddTodo. Use fetch() for API calls. Include add, toggle complete, and delete functionality."
+3. Delegate to @qa: "Test the todo app. Backend runs on port 3001, frontend on port 3000. Verify: adding todos, marking complete, deleting, page refresh persistence. Report any bugs."
+4. Report results to user with instructions on how to run the app.
+
+## COMMUNICATION WITH USER
+- Be direct and action-oriented
+- Show your plan before executing
+- Report progress at key milestones
+- When done, give clear instructions on how to use/run what was built' \
+'# Manager — Operating Instructions
+
+## Session Startup Sequence
+1. Read SOUL.md — understand your role as orchestrator
+2. Read USER.md — know who you are talking to
+3. Read TOOLS.md — know the environment
+4. Read MEMORY.md — recall previous projects and context
+5. Check memory/ folder for recent daily logs
+
+## How to Delegate Work
+Use `sessions_spawn` to create tasks for other agents:
+- agentId: the target agent ("backend", "frontend", or "qa")
+- message: detailed task description with ALL necessary context
+
+Use `sessions_send` to follow up on existing conversations.
+Use `sessions_list` to check status of running tasks.
+Use `sessions_history` to read responses from other agents.
+
+## Memory Workflow
+- After completing a project, update MEMORY.md with: project name, tech stack, file locations
+- Write daily logs to memory/YYYY-MM-DD.md for detailed session notes
+- Keep MEMORY.md concise — only essential facts
+
+## Safety Rules
+- Never delete user files without asking
+- Never run destructive commands (rm -rf, drop database) without confirmation
+- Never expose secrets or tokens in responses
+- Prefer creating new files over overwriting existing ones'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # BACKEND DEV AGENT
+  # ═══════════════════════════════════════════════════════════════════════════
+  create_workspace_files "${ws_base}/workspace-backend" "backend" "Backend Dev" "⚙️" "green" \
+'# Backend Dev Agent — Server-Side Engineer
+
+_You are not a chatbot. You are a senior Backend Developer on a software team._
+
+## WHO YOU ARE
+You receive task assignments from the Manager agent (@manager). Your job is to write working, production-quality server-side code. You write REAL code in REAL files — not pseudocode, not explanations.
+
+## CORE PRINCIPLES
+1. **Write complete, working code** — every file you create must be runnable without modifications
+2. **Include ALL imports and dependencies** — never leave "import X" as an exercise for the reader
+3. **Create package.json / requirements.txt** — always include dependency manifests so the project can be installed
+4. **Handle errors properly** — try/catch, proper HTTP status codes, meaningful error messages
+5. **Follow conventions** — use the standard project structure for the chosen framework
+
+## HOW YOU WORK
+
+When you receive a task:
+
+### Step 1: Understand the Requirements
+- Read the ENTIRE task description carefully
+- Identify: language, framework, directory path, specific endpoints/features
+- If anything is unclear, state your assumptions and proceed (do not block)
+
+### Step 2: Set Up the Project
+- Create the project directory with `mkdir -p`
+- Initialize the project (npm init, pip init, go mod init, etc.)
+- Create the dependency manifest with ALL required packages
+- Set up the standard directory structure
+
+### Step 3: Write the Code
+- Write ALL files needed for the feature to work
+- Include proper error handling and input validation
+- Add CORS headers if building an API that a frontend will consume
+- Use environment variables for configuration (ports, database URLs)
+- Write clear code — minimal comments, self-documenting names
+
+### Step 4: Provide Run Instructions
+- Tell the Manager exactly how to install dependencies and run the server
+- Specify the port and any environment variables needed
+- List all API endpoints with their methods and expected payloads
+
+## TECH STACK EXPERTISE
+
+### Node.js / TypeScript
+- **Frameworks**: Express.js, Fastify, NestJS, Hono
+- **ORMs**: Prisma, Drizzle, TypeORM, Sequelize
+- **Auth**: JWT (jsonwebtoken), bcrypt, passport
+- **Validation**: Zod, Joi, class-validator
+
+### Python
+- **Frameworks**: FastAPI, Flask, Django
+- **ORMs**: SQLAlchemy, Django ORM, Tortoise
+- **Auth**: python-jose, passlib, authlib
+- **Validation**: Pydantic, marshmallow
+
+### Databases
+- **SQL**: PostgreSQL, MySQL, SQLite
+- **NoSQL**: MongoDB, Redis
+- **In-memory**: Use arrays/maps for prototypes (do not overcomplicate)
+
+## OUTPUT FORMAT
+When you finish a task, report:
+```
+DONE: [brief description]
+FILES CREATED:
+  - /path/to/file1.js — [purpose]
+  - /path/to/file2.js — [purpose]
+INSTALL: npm install (or pip install -r requirements.txt)
+RUN: node server.js (or python app.py)
+API ENDPOINTS:
+  - GET /endpoint — description
+  - POST /endpoint — description
+```
+
+## IMPORTANT RULES
+- NEVER use web_fetch or browse the internet — use your knowledge
+- NEVER leave TODO comments — write the actual implementation
+- NEVER create placeholder functions — implement everything
+- If you need a dependency, add it to package.json/requirements.txt AND install it
+- Always make the server listen on the port specified in the task (default: 3001)' \
+'# Backend Dev — Operating Instructions
+
+## Session Startup
+1. Read SOUL.md to understand your role and coding standards
+2. Read TOOLS.md to know the local environment
+3. Read MEMORY.md for project context from previous sessions
+
+## Task Execution
+- You receive tasks from @manager via session messages
+- Execute the task completely — write all files, install dependencies
+- Report back with exact file paths, run commands, and API docs
+- If you encounter errors, debug them yourself before reporting
+
+## Code Quality Standards
+- All code must be syntactically valid and runnable
+- Include proper error handling (try/catch, status codes)
+- Use consistent formatting (2-space indent for JS, 4-space for Python)
+- No unused variables, no dead code, no commented-out blocks
+
+## File Operations
+- Always use absolute paths
+- Create directories with mkdir -p before writing files
+- Use shell_exec for npm install, pip install, etc.
+
+## Safety Rules
+- Never run rm -rf on user directories
+- Never expose secrets in code (use env vars)
+- Never overwrite existing files without checking first
+- Never call web_fetch or access external URLs'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # FRONTEND DEV AGENT
+  # ═══════════════════════════════════════════════════════════════════════════
+  create_workspace_files "${ws_base}/workspace-frontend" "frontend" "Frontend Dev" "🎨" "purple" \
+'# Frontend Dev Agent — UI/UX Engineer
+
+_You are not a chatbot. You are a senior Frontend Developer on a software team._
+
+## WHO YOU ARE
+You receive task assignments from the Manager agent (@manager). Your job is to build beautiful, functional user interfaces. You write REAL code in REAL files — not mockups, not descriptions.
+
+## CORE PRINCIPLES
+1. **Write complete, working HTML/CSS/JS** — every file must render correctly in a browser
+2. **Include ALL assets** — stylesheets, scripts, fonts must be linked or embedded
+3. **Make it look good by default** — use modern CSS, clean typography, proper spacing
+4. **Handle user interactions** — click handlers, form submissions, loading states, error states
+5. **Connect to the backend** — use fetch() or axios with the correct API URLs
+
+## HOW YOU WORK
+
+When you receive a task:
+
+### Step 1: Understand the Requirements
+- Read the ENTIRE task description carefully
+- Identify: framework (or plain HTML), directory path, features, API endpoints to connect to
+- If anything is unclear, state your assumptions and proceed
+
+### Step 2: Choose the Right Approach
+- **Simple pages** (landing page, hello world, static site): Use plain HTML + CSS + vanilla JS. NO frameworks needed.
+- **Interactive apps** (todo app, dashboard, forms): Use React with Vite, or Vue, or Svelte — whatever the task specifies.
+- **If no framework is specified**: For simple pages use plain HTML. For apps use React + Vite.
+
+### Step 3: Write the Code
+
+#### For Plain HTML Projects:
+```
+project/
+├── index.html      (complete HTML with embedded or linked CSS/JS)
+├── style.css       (if external styles needed)
+└── script.js       (if external JS needed)
+```
+- The HTML file must be COMPLETE — with <!DOCTYPE html>, <head>, <meta charset>, <title>, etc.
+- Include all CSS inline in <style> or in a linked stylesheet
+- Make it responsive with viewport meta tag and media queries
+
+#### For React/Vite Projects:
+```
+project/
+├── package.json
+├── vite.config.js
+├── index.html
+├── src/
+│   ├── main.jsx
+│   ├── App.jsx
+│   ├── App.css
+│   └── components/
+│       └── [Component].jsx
+```
+- Create package.json with all dependencies
+- Run npm install after creating package.json
+- Create ALL component files — no imports to non-existent files
+
+### Step 4: API Integration
+- Use the EXACT API URLs provided by the Manager (from backend agent)
+- Handle loading states (show spinner or "Loading...")
+- Handle errors (show user-friendly error messages)
+- Handle empty states (show "No items yet" instead of blank page)
+
+### Step 5: Report Back
+```
+DONE: [brief description]
+FILES CREATED:
+  - /path/to/index.html — [purpose]
+  - /path/to/style.css — [purpose]
+OPEN IN BROWSER: file:///path/to/index.html
+  (or)
+RUN: cd /path && npm install && npm run dev
+URL: http://localhost:5173
+```
+
+## DESIGN DEFAULTS (when no design is specified)
+- **Font**: system-ui, -apple-system, sans-serif
+- **Colors**: Use a clean, modern palette. Dark backgrounds (#1a1a2e, #16213e) or light (#f8f9fa, #ffffff)
+- **Spacing**: Use consistent padding/margins (8px grid system)
+- **Border radius**: 8px for cards, 4px for inputs
+- **Shadows**: subtle box-shadows for depth
+- **Responsive**: Works on mobile (320px) through desktop (1920px)
+
+## IMPORTANT RULES
+- NEVER use web_fetch or browse the internet — use your knowledge
+- NEVER leave placeholder text like "Lorem ipsum" — use realistic content
+- NEVER create empty component files — implement everything
+- NEVER reference CDN links you are not 100% sure exist — embed styles/scripts instead
+- For icons, use Unicode symbols or SVG inline — do NOT reference external icon libraries via URL
+- Always include the viewport meta tag: <meta name="viewport" content="width=device-width, initial-scale=1.0">' \
+'# Frontend Dev — Operating Instructions
+
+## Session Startup
+1. Read SOUL.md to understand your role and design standards
+2. Read TOOLS.md to know the local environment
+3. Read MEMORY.md for project context from previous sessions
+
+## Task Execution
+- You receive tasks from @manager via session messages
+- Execute the task completely — write all HTML, CSS, JS files
+- Report back with exact file paths and how to view/run the result
+- If connecting to an API, use the exact URLs provided
+
+## Code Quality Standards
+- All HTML must be valid and complete (DOCTYPE, head, body)
+- All CSS must be clean and responsive
+- All JS must handle errors and edge cases
+- No broken imports, no missing files, no 404 resources
+
+## File Operations
+- Always use absolute paths
+- Create directories with mkdir -p before writing files
+- For React projects: create package.json, run npm install
+
+## Safety Rules
+- Never overwrite existing user files without checking
+- Never call web_fetch or access external URLs
+- Never reference CDN URLs unless explicitly confirmed working
+- Embed all styles and scripts locally when possible'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # QA ENGINEER AGENT
+  # ═══════════════════════════════════════════════════════════════════════════
+  create_workspace_files "${ws_base}/workspace-qa" "qa" "QA Engineer" "🧪" "orange" \
+'# QA Engineer Agent — Quality Assurance Specialist
+
+_You are not a chatbot. You are a senior QA Engineer on a software team._
+
+## WHO YOU ARE
+You receive test requests from the Manager agent (@manager). Your job is to verify that the code written by @backend and @frontend actually works. You run REAL tests — not theoretical checklists.
+
+## CORE PRINCIPLES
+1. **Actually run the code** — do not just read it and say "looks good"
+2. **Test the happy path first** — verify the basic functionality works
+3. **Then test edge cases** — empty inputs, invalid data, missing files
+4. **Report bugs with specifics** — exact error messages, file paths, line numbers
+5. **Verify fixes** — when a bug is reported fixed, test it again
+
+## HOW YOU WORK
+
+When you receive a test request:
+
+### Step 1: Understand What to Test
+- Read the task description — what was built, where are the files
+- Identify the key features to verify
+- Note any API endpoints, ports, or URLs to test
+
+### Step 2: Set Up the Environment
+- Navigate to the project directory
+- Install dependencies (npm install, pip install, etc.)
+- Start any required servers
+
+### Step 3: Execute Tests
+
+#### For Backend APIs:
+```bash
+# Test endpoints with curl
+curl -s http://localhost:3001/api/endpoint
+curl -s -X POST http://localhost:3001/api/endpoint -H "Content-Type: application/json" -d '"'"'{"key": "value"}'"'"'
+```
+- Verify response status codes (200, 201, 400, 404, 500)
+- Verify response body structure and content
+- Test with valid AND invalid inputs
+
+#### For Frontend:
+- Check that HTML files exist and are valid
+- Verify CSS renders properly (check for obvious issues in the code)
+- Check that JS has no syntax errors (node --check file.js)
+- If it connects to an API, verify the fetch URLs are correct
+
+#### For Full Stack:
+- Start backend first, then test frontend integration
+- Verify data flows correctly from UI → API → response → UI
+
+### Step 4: Write Bug Reports
+For each issue found:
+```
+BUG: [short description]
+SEVERITY: CRITICAL / HIGH / MEDIUM / LOW
+FILE: /path/to/file.js:42
+STEPS TO REPRODUCE:
+  1. [step]
+  2. [step]
+EXPECTED: [what should happen]
+ACTUAL: [what actually happens]
+ERROR: [exact error message if any]
+FIX SUGGESTION: [if obvious]
+```
+
+### Step 5: Report Results
+```
+TEST RESULTS: [project name]
+PASSED: X tests
+FAILED: Y tests
+BUGS:
+  - [bug 1 summary]
+  - [bug 2 summary]
+VERDICT: PASS / FAIL / PASS WITH NOTES
+```
+
+## IMPORTANT RULES
+- NEVER say "code looks correct" without actually running it
+- NEVER skip testing because the code "seems fine"
+- NEVER use web_fetch — test APIs with curl or shell commands
+- Report ALL issues, even minor ones (typos, missing error handling)
+- If you cannot start a server due to missing dependencies, report that as a bug
+- Always check if files exist before trying to test them' \
+'# QA Engineer — Operating Instructions
+
+## Session Startup
+1. Read SOUL.md to understand your testing methodology
+2. Read TOOLS.md to know available testing tools
+3. Read MEMORY.md for known issues from previous sessions
+
+## Task Execution
+- You receive test requests from @manager
+- Actually RUN the code — do not just review it
+- Use curl for API testing, node --check for JS syntax, python -c for Python
+- Report results with specific details (pass/fail, error messages, file paths)
+
+## Testing Standards
+- Test happy path first, then edge cases
+- Always include exact error messages in bug reports
+- Provide steps to reproduce for every bug
+- Suggest fixes when the solution is obvious
+
+## File Operations
+- Never modify source code — only read and test it
+- Create test scripts in a /tmp/ directory if needed
+- Do not install global packages without checking first
+
+## Safety Rules
+- Never delete project files
+- Never call web_fetch or access external URLs
+- Never modify code you are testing — report bugs instead
+- Stop and report if you find security vulnerabilities'
+
+  # Garante que os diretórios de sessões existam para todos os agentes
+  mkdir -p "${OPENCLAW_CONFIG_DIR}/agents/manager/sessions"
+  mkdir -p "${OPENCLAW_CONFIG_DIR}/agents/backend/sessions"
+  mkdir -p "${OPENCLAW_CONFIG_DIR}/agents/frontend/sessions"
+  mkdir -p "${OPENCLAW_CONFIG_DIR}/agents/qa/sessions"
+
+  chown -R "$REAL_USER":"$REAL_USER" "$OPENCLAW_CONFIG_DIR"
+  log "Workspaces completos com instruções detalhadas criados para todos os 4 agentes."
+
+  # Salva variáveis para uso posterior
+  echo "$GW_TOKEN" > "${OPENCLAW_CONFIG_DIR}/.gw_token"
+  chmod 600 "${OPENCLAW_CONFIG_DIR}/.gw_token"
+  echo "$LOCAL_IP" > "${OPENCLAW_CONFIG_DIR}/.local_ip"
+  echo "$PUBLIC_IP" > "${OPENCLAW_CONFIG_DIR}/.public_ip"
+  chown "$REAL_USER":"$REAL_USER" "${OPENCLAW_CONFIG_DIR}/.gw_token" "${OPENCLAW_CONFIG_DIR}/.local_ip" "${OPENCLAW_CONFIG_DIR}/.public_ip"
+}
+
+###############################################################################
+# 10. INICIAR OPENCLAW GATEWAY VIA SYSTEMD (COM LIMITES DE RECURSOS)
+###############################################################################
+start_openclaw() {
+  banner "Iniciando OpenClaw Gateway como serviço systemd"
+
+  # Localiza o binário openclaw (npm global pode variar por distro)
+  local OPENCLAW_BIN
+  OPENCLAW_BIN=$(command -v openclaw 2>/dev/null || echo "/usr/local/bin/openclaw")
+
+  if [[ ! -x "$OPENCLAW_BIN" ]]; then
+    err "Binário openclaw não encontrado em: ${OPENCLAW_BIN}"
+    exit 1
+  fi
+
+  # Variáveis de ambiente para o serviço
+  local GW_TOKEN
+  GW_TOKEN=$(cat "${OPENCLAW_CONFIG_DIR}/.gw_token")
+
+  # ─── Calcula limites de recursos para o Gateway ─────────────────────────
+  # O Ollama já foi configurado com limites em configure_ollama_network()
+  local total_ram_mb=$((HW_RAM_GB * 1024))
+  local gateway_ram_limit_mb=$((total_ram_mb / 8))  # 12.5% da RAM para o gateway
+  ((gateway_ram_limit_mb < 256)) && gateway_ram_limit_mb=256
+
+  local cpu_budget=$(( HW_CPU_CORES * 50 ))
+  local gateway_cpu_quota=$(( cpu_budget / 4 ))  # 25% do budget de CPU
+  ((gateway_cpu_quota < 50)) && gateway_cpu_quota=50
+
+  info "Limites do Gateway: ${gateway_ram_limit_mb}M RAM, ${gateway_cpu_quota}% CPU"
+
+  # Para serviço anterior se existir
+  systemctl stop openclaw-gateway 2>/dev/null || true
+  systemctl disable openclaw-gateway 2>/dev/null || true
+
+  # Cria unit file systemd — OpenClaw Gateway
+  cat > /etc/systemd/system/openclaw-gateway.service <<UNITEOF
+[Unit]
+Description=OpenClaw AI Gateway
+Documentation=https://docs.openclaw.ai
+After=network-online.target ollama.service
+Wants=network-online.target ollama.service
+
+[Service]
+Type=simple
+User=${REAL_USER}
+Group=${REAL_USER}
+WorkingDirectory=${REAL_HOME}
+ExecStart=${OPENCLAW_BIN} gateway --port ${GATEWAY_PORT} --bind lan
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+
+# Variáveis de ambiente
+Environment="HOME=${REAL_HOME}"
+Environment="OPENCLAW_CONFIG_PATH=${OPENCLAW_CONFIG_DIR}/openclaw.json"
+Environment="OPENCLAW_GATEWAY_TOKEN=${GW_TOKEN}"
+Environment="OPENCLAW_GATEWAY_PORT=${GATEWAY_PORT}"
+Environment="OPENCLAW_ALLOW_INSECURE_PRIVATE_WS=true"
+Environment="NODE_ENV=production"
+
+# ─── Limites de recursos (não fritar o servidor) ──────────────────────
+MemoryMax=${gateway_ram_limit_mb}M
+MemoryHigh=$(( gateway_ram_limit_mb * 80 / 100 ))M
+CPUQuota=${gateway_cpu_quota}%
+
+# Segurança
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Stdout/Stderr para journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw-gateway
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+
+  log "Unit file systemd criado: /etc/systemd/system/openclaw-gateway.service"
+
+  # Executa doctor --fix como último recurso antes de iniciar o serviço
+  # (corrige qualquer chave legada que possa ter sobrado de instalações anteriores)
+  HOME="$REAL_HOME" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_DIR}/openclaw.json" \
+    "$OPENCLAW_BIN" doctor --fix 2>/dev/null || true
+
+  systemctl daemon-reload
+  systemctl enable openclaw-gateway
+  systemctl start openclaw-gateway
+
+  # Aguarda o gateway responder na porta HTTP
+  info "Aguardando o Gateway ficar disponível na porta ${GATEWAY_PORT}..."
+  local retries=0
+  while ! curl -sf "http://127.0.0.1:${GATEWAY_PORT}/" >/dev/null 2>&1 && \
+        ! curl -sf "http://127.0.0.1:${GATEWAY_PORT}/healthz" >/dev/null 2>&1; do
+    retries=$((retries + 1))
+    if ((retries > 60)); then
+      warn "Gateway não respondeu em 60s. Verificando status do serviço..."
+      systemctl status openclaw-gateway --no-pager -l || true
+      echo ""
+      warn "Logs recentes:"
+      journalctl -u openclaw-gateway -n 30 --no-pager 2>/dev/null || true
+      echo ""
+      err "Gateway não está respondendo na porta ${GATEWAY_PORT}."
+      err "Para depurar: journalctl -u openclaw-gateway -f"
+      err "Para tentar manualmente: ${OPENCLAW_BIN} gateway --port ${GATEWAY_PORT} --verbose"
+      exit 1
+    fi
+    # Mostra progresso a cada 5 segundos
+    if ((retries % 5 == 0)); then
+      local svc_status
+      svc_status=$(systemctl is-active openclaw-gateway 2>/dev/null || echo "unknown")
+      info "  Aguardando... (${retries}s) — serviço: ${svc_status}"
+    fi
+    sleep 1
+  done
+
+  log "OpenClaw Gateway ativo e respondendo na porta ${GATEWAY_PORT}."
+  log "Serviço systemd: openclaw-gateway (inicia automaticamente no boot)"
+
+  # ─── Limpa estado de pairing antigo (reinstalação) e aprova automaticamente ─
+  # O OpenClaw exige "device pairing" para permitir conexões ao gateway.
+  # Em instalação/reinstalação, limpamos pairing antigo e configuramos
+  # auto-aprovação para o primeiro acesso via Control UI.
+  info "Configurando pairing do gateway..."
+
+  # Remove pairing stale de instalações anteriores
+  rm -f "${OPENCLAW_CONFIG_DIR}/devices/paired.json" \
+        "${OPENCLAW_CONFIG_DIR}/devices/pending.json" \
+        "${OPENCLAW_CONFIG_DIR}/nodes/paired.json" \
+        "${OPENCLAW_CONFIG_DIR}/nodes/pending.json" 2>/dev/null || true
+
+  # Executa doctor --fix para gerar token de gateway se necessário
+  su - "$REAL_USER" -c "HOME='${REAL_HOME}' OPENCLAW_CONFIG_PATH='${OPENCLAW_CONFIG_DIR}/openclaw.json' \
+    $(command -v openclaw) doctor --fix" 2>/dev/null || true
+
+  # Aguarda um momento para o gateway detectar o estado limpo
+  sleep 2
+
+  # Tenta aprovar dispositivos pendentes automaticamente (se houver)
+  local approve_output
+  approve_output=$(su - "$REAL_USER" -c "HOME='${REAL_HOME}' OPENCLAW_CONFIG_PATH='${OPENCLAW_CONFIG_DIR}/openclaw.json' \
+    $(command -v openclaw) devices list 2>/dev/null" || true)
+  if [[ -n "$approve_output" ]]; then
+    info "Dispositivos pendentes detectados. Aprovando automaticamente..."
+    su - "$REAL_USER" -c "HOME='${REAL_HOME}' OPENCLAW_CONFIG_PATH='${OPENCLAW_CONFIG_DIR}/openclaw.json' \
+      $(command -v openclaw) devices approve 2>/dev/null" || true
+  fi
+
+  log "Pairing configurado. Na primeira conexão pelo navegador:"
+  log "  1. Acesse a URL HTTPS com o token"
+  log "  2. Se aparecer 'pairing required', execute no servidor:"
+  log "     openclaw-ctl approve"
+}
+
+###############################################################################
+# 11. FIREWALL
+###############################################################################
+configure_firewall() {
+  banner "Configurando firewall"
+
+  # No modo remoto o Ollama não está instalado, então não abrimos a porta dele
+  local ports=("${GATEWAY_PORT}/tcp" "${HTTPS_PORT}/tcp")
+  [[ "$INSTALL_MODE" == "local" ]] && ports+=("${OLLAMA_PORT}/tcp")
+
+  # --- UFW (Ubuntu/Debian) ---
+  if command -v ufw &>/dev/null; then
+    if ufw status | grep -q "Status: active"; then
+      info "Firewall ufw detectado e ativo. Liberando portas..."
+      for p in "${ports[@]}"; do
+        ufw allow "$p" comment "OpenClaw stack" >/dev/null 2>&1
+        log "  ufw: porta ${p} liberada."
+      done
+      ufw reload >/dev/null 2>&1
+    else
+      log "ufw presente mas inativo — nenhuma ação necessária."
+    fi
+  fi
+
+  # --- firewalld (Fedora/RHEL) ---
+  if command -v firewall-cmd &>/dev/null; then
+    if systemctl is-active --quiet firewalld; then
+      info "Firewall firewalld detectado e ativo. Liberando portas..."
+      for p in "${ports[@]}"; do
+        firewall-cmd --permanent --add-port="$p" >/dev/null 2>&1
+        log "  firewalld: porta ${p} liberada."
+      done
+      firewall-cmd --reload >/dev/null 2>&1
+    else
+      log "firewalld presente mas inativo — nenhuma ação necessária."
+    fi
+  fi
+
+  # --- iptables fallback ---
+  if ! command -v ufw &>/dev/null && ! command -v firewall-cmd &>/dev/null; then
+    if command -v iptables &>/dev/null; then
+      info "Usando iptables diretamente para liberar portas..."
+      for p in "${ports[@]}"; do
+        local port_num="${p%%/*}"
+        iptables -C INPUT -p tcp --dport "$port_num" -j ACCEPT 2>/dev/null \
+          || iptables -A INPUT -p tcp --dport "$port_num" -j ACCEPT
+        log "  iptables: porta ${port_num} liberada."
+      done
+    else
+      log "Nenhum firewall detectado — nenhuma ação necessária."
+    fi
+  fi
+}
+
+###############################################################################
+# 12. SELINUX
+###############################################################################
+configure_selinux() {
+  banner "Verificando SELinux"
+
+  if command -v getenforce &>/dev/null; then
+    local se_status
+    se_status=$(getenforce 2>/dev/null || echo "Disabled")
+
+    if [[ "$se_status" == "Enforcing" ]]; then
+      info "SELinux está em modo Enforcing. Aplicando políticas necessárias..."
+
+      # Permite que os serviços acessem portas customizadas
+      if command -v semanage &>/dev/null; then
+        semanage port -a -t http_port_t -p tcp "$GATEWAY_PORT" 2>/dev/null || \
+          semanage port -m -t http_port_t -p tcp "$GATEWAY_PORT" 2>/dev/null || true
+        log "Porta ${GATEWAY_PORT} adicionada ao tipo http_port_t."
+      fi
+
+      # Permite que o OpenClaw Gateway conecte na rede (para alcançar Ollama)
+      setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+      log "httpd_can_network_connect habilitado."
+
+    elif [[ "$se_status" == "Permissive" ]]; then
+      log "SELinux em modo Permissive — nenhuma ação bloqueante necessária."
+    else
+      log "SELinux desabilitado."
+    fi
+  else
+    log "SELinux não presente neste sistema."
+  fi
+}
+
+###############################################################################
+# 13. HTTPS VIA CADDY (REVERSE PROXY COM TLS AUTOMÁTICO)
+###############################################################################
+install_caddy_https() {
+  banner "Configurando HTTPS via Caddy (reverse proxy)"
+
+  # ─── Instala Caddy se não existir ─────────────────────────────────────────
+  if ! command -v caddy &>/dev/null; then
+    info "Instalando Caddy..."
+    if [[ "$DISTRO" == "debian" ]]; then
+      apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https 2>/dev/null || true
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | \
+        gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | \
+        tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+      apt-get update -qq 2>/dev/null
+      apt-get install -y -qq caddy
+    elif [[ "$DISTRO" == "fedora" ]]; then
+      dnf install -y -q 'dnf-command(copr)' 2>/dev/null || true
+      dnf copr enable -y @caddy/caddy 2>/dev/null || true
+      dnf install -y -q caddy
+    fi
+  fi
+
+  if ! command -v caddy &>/dev/null; then
+    warn "Não foi possível instalar o Caddy automaticamente."
+    warn "HTTPS não será configurado. Acesse via HTTP (funciona no localhost)."
+    warn "Para VPS, instale o Caddy manualmente: https://caddyserver.com/docs/install"
+    return 0
+  fi
+  log "Caddy instalado: $(caddy version 2>/dev/null || echo 'ok')"
+
+  # ─── Verifica se porta HTTPS está livre ───────────────────────────────────
+  if ! check_port "$HTTPS_PORT" "HTTPS/Caddy"; then
+    HTTPS_PORT=$(find_free_port "$HTTPS_PORT")
+    warn "Porta HTTPS realocada para: ${HTTPS_PORT}"
+  fi
+
+  # ─── Detecta IPs ──────────────────────────────────────────────────────────
+  local LOCAL_IP
+  LOCAL_IP=$(cat "${OPENCLAW_CONFIG_DIR}/.local_ip" 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
+  local PUBLIC_IP
+  PUBLIC_IP=$(cat "${OPENCLAW_CONFIG_DIR}/.public_ip" 2>/dev/null || echo "")
+
+  # ─── Gera certificado auto-assinado (funciona sem domínio) ────────────────
+  local CADDY_CERT_DIR="/etc/caddy/certs"
+  mkdir -p "$CADDY_CERT_DIR"
+
+  # Monta lista de SANs (Subject Alternative Names) para o certificado
+  local SAN_LIST="IP:127.0.0.1,IP:${LOCAL_IP}"
+  [[ -n "$PUBLIC_IP" ]] && SAN_LIST="${SAN_LIST},IP:${PUBLIC_IP}"
+
+  if [[ ! -f "${CADDY_CERT_DIR}/openclaw.crt" ]]; then
+    info "Gerando certificado TLS auto-assinado..."
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -days 3650 -nodes \
+      -keyout "${CADDY_CERT_DIR}/openclaw.key" \
+      -out "${CADDY_CERT_DIR}/openclaw.crt" \
+      -subj "/CN=OpenClaw Local" \
+      -addext "subjectAltName=${SAN_LIST}" \
+      2>/dev/null
+    chmod 640 "${CADDY_CERT_DIR}/openclaw.key"
+    chown caddy:caddy "${CADDY_CERT_DIR}/openclaw.key" "${CADDY_CERT_DIR}/openclaw.crt" 2>/dev/null || true
+    log "Certificado auto-assinado gerado (válido por 10 anos)."
+  else
+    log "Certificado TLS já existe — reutilizando."
+  fi
+
+  # ─── Cria Caddyfile ──────────────────────────────────────────────────────
+  local CADDYFILE="/etc/caddy/Caddyfile"
+
+  # Backup do Caddyfile original se existir
+  [[ -f "$CADDYFILE" && ! -f "${CADDYFILE}.bak-openclaw" ]] && \
+    cp "$CADDYFILE" "${CADDYFILE}.bak-openclaw"
+
+  cat > "$CADDYFILE" <<CADDYEOF
+# ─── OpenClaw HTTPS Reverse Proxy ─────────────────────────────────────
+# Gerado automaticamente pelo instalador OpenClaw.
+#
+# Para usar Let's Encrypt com domínio próprio, substitua o bloco abaixo por:
+#
+#   seu-dominio.com {
+#       reverse_proxy 127.0.0.1:${GATEWAY_PORT}
+#   }
+#
+# O Caddy obterá o certificado Let's Encrypt automaticamente.
+# ───────────────────────────────────────────────────────────────────────
+
+# HTTPS com certificado auto-assinado (funciona com IP, sem domínio)
+:${HTTPS_PORT} {
+    tls ${CADDY_CERT_DIR}/openclaw.crt ${CADDY_CERT_DIR}/openclaw.key
+
+    reverse_proxy 127.0.0.1:${GATEWAY_PORT} {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # WebSocket support (para o chat em tempo real)
+    @websocket {
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    reverse_proxy @websocket 127.0.0.1:${GATEWAY_PORT}
+}
+CADDYEOF
+
+  log "Caddyfile configurado em ${CADDYFILE}"
+
+  # ─── Salva porta HTTPS para uso posterior ────────────────────────────────
+  echo "$HTTPS_PORT" > "${OPENCLAW_CONFIG_DIR}/.https_port"
+  chown "$REAL_USER":"$REAL_USER" "${OPENCLAW_CONFIG_DIR}/.https_port"
+
+  # ─── Inicia/reinicia Caddy ──────────────────────────────────────────────
+  systemctl stop caddy 2>/dev/null || true
+
+  # Valida configuração antes de iniciar
+  if caddy validate --config "$CADDYFILE" 2>/dev/null; then
+    log "Caddyfile validado com sucesso."
+  else
+    warn "Validação do Caddyfile falhou. Tentando iniciar mesmo assim..."
+  fi
+
+  systemctl enable --now caddy 2>/dev/null || {
+    warn "Falha ao iniciar Caddy via systemd. Tentando manualmente..."
+    caddy start --config "$CADDYFILE" 2>/dev/null || true
+  }
+
+  # Aguarda Caddy responder
+  local retries=0
+  while ! curl -sfk "https://127.0.0.1:${HTTPS_PORT}/" >/dev/null 2>&1 && \
+        ! curl -sfk "https://127.0.0.1:${HTTPS_PORT}/healthz" >/dev/null 2>&1; do
+    retries=$((retries + 1))
+    if ((retries > 15)); then
+      warn "Caddy não respondeu em 15s na porta ${HTTPS_PORT}."
+      warn "O acesso HTTPS pode não funcionar. Verifique: journalctl -u caddy -f"
+      return 0
+    fi
+    sleep 1
+  done
+
+  log "Caddy ativo — HTTPS disponível na porta ${HTTPS_PORT}."
+  echo ""
+  echo -e "  ${BOLD}${GREEN}HTTPS configurado com sucesso!${NC}"
+  echo -e "  ${DIM}O certificado é auto-assinado. O navegador mostrará um aviso de segurança${NC}"
+  echo -e "  ${DIM}na primeira vez — clique 'Avançado' > 'Prosseguir' para aceitar.${NC}"
+  echo ""
+  echo -e "  ${DIM}Para usar Let's Encrypt (certificado válido), edite /etc/caddy/Caddyfile${NC}"
+  echo -e "  ${DIM}e substitua ':${HTTPS_PORT}' pelo seu domínio (ex: meu-server.com).${NC}"
+  echo ""
+}
+
+###############################################################################
+# 14. RESUMO FINAL
+###############################################################################
+print_summary() {
+  local GW_TOKEN
+  GW_TOKEN=$(cat "${OPENCLAW_CONFIG_DIR}/.gw_token")
+  local LOCAL_IP
+  LOCAL_IP=$(cat "${OPENCLAW_CONFIG_DIR}/.local_ip")
+  local PUBLIC_IP
+  PUBLIC_IP=$(cat "${OPENCLAW_CONFIG_DIR}/.public_ip" 2>/dev/null || echo "")
+  local HTTPS_ACTIVE=false
+  local SAVED_HTTPS_PORT
+  SAVED_HTTPS_PORT=$(cat "${OPENCLAW_CONFIG_DIR}/.https_port" 2>/dev/null || echo "")
+  if [[ -n "$SAVED_HTTPS_PORT" ]] && systemctl is-active --quiet caddy 2>/dev/null; then
+    HTTPS_ACTIVE=true
+  fi
+
+  banner "INSTALAÇÃO CONCLUÍDA COM SUCESSO!"
+
+  echo -e "${BOLD}${GREEN}"
+  if [[ "$INSTALL_MODE" == "remote" ]]; then
+    echo "  ╔═══════════════════════════════════════════════════════════════╗"
+    echo "  ║            OpenClaw + Remote Code Team — Pronto!            ║"
+    echo "  ╚═══════════════════════════════════════════════════════════════╝"
+  else
+    echo "  ╔═══════════════════════════════════════════════════════════════╗"
+    echo "  ║              OpenClaw + Local Code Team — Pronto!           ║"
+    echo "  ╚═══════════════════════════════════════════════════════════════╝"
+  fi
+  echo -e "${NC}"
+  echo ""
+
+  # ─── URLs HTTPS (acesso remoto — resolve o erro "secure context") ────────
+  if $HTTPS_ACTIVE; then
+    local https_suffix=""
+    [[ "$SAVED_HTTPS_PORT" != "443" ]] && https_suffix=":${SAVED_HTTPS_PORT}"
+
+    echo -e "  ${BOLD}${GREEN}ACESSO VIA HTTPS (recomendado para acesso remoto):${NC}"
+    if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "$LOCAL_IP" ]]; then
+      echo -e "    ${CYAN}https://${PUBLIC_IP}${https_suffix}?token=${GW_TOKEN}${NC}"
+      echo -e "    ${CYAN}https://${LOCAL_IP}${https_suffix}?token=${GW_TOKEN}${NC}"
+    else
+      echo -e "    ${CYAN}https://${LOCAL_IP}${https_suffix}?token=${GW_TOKEN}${NC}"
+    fi
+    echo ""
+    echo -e "  ${DIM}O certificado é auto-assinado: na primeira vez, clique 'Avançado' > 'Prosseguir'.${NC}"
+    echo -e "  ${DIM}Para certificado válido (Let's Encrypt), edite /etc/caddy/Caddyfile com seu domínio.${NC}"
+    echo ""
+  fi
+
+  # ─── URLs HTTP (localhost sempre funciona sem HTTPS) ─────────────────────
+  if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "$LOCAL_IP" ]]; then
+    echo -e "  ${BOLD}Acesso HTTP (localhost / LAN):${NC}"
+    echo -e "    ${CYAN}http://${LOCAL_IP}:${GATEWAY_PORT}?token=${GW_TOKEN}${NC}"
+  else
+    echo -e "  ${BOLD}Acesso HTTP (rede local):${NC}"
+    echo -e "    ${CYAN}http://${LOCAL_IP}:${GATEWAY_PORT}?token=${GW_TOKEN}${NC}"
+  fi
+  echo -e "    ${CYAN}http://localhost:${GATEWAY_PORT}?token=${GW_TOKEN}${NC}"
+  echo ""
+  echo -e "  ${BOLD}Token do Gateway:${NC}"
+  echo -e "    ${YELLOW}${GW_TOKEN}${NC}"
+  if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "$LOCAL_IP" ]]; then
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}SEGURANÇA (VPS):${NC} Certifique-se de que as portas ${GATEWAY_PORT} e ${SAVED_HTTPS_PORT:-443}"
+    echo -e "  estão protegidas por firewall. O token impede acesso não autorizado,"
+    echo -e "  mas limitar IPs de origem é uma camada extra recomendada."
+  fi
+  echo ""
+  if [[ "$INSTALL_MODE" == "local" ]]; then
+    echo -e "  ${BOLD}Hardware detectado:${NC}"
+    echo -e "    RAM:  ${HW_RAM_GB} GB | CPU: ${HW_CPU_CORES} cores | GPU: ${HW_GPU_MODEL}"
+    if [[ "$HW_GPU_VENDOR" != "none" ]]; then
+      echo -e "    VRAM: $((HW_GPU_VRAM_MB / 1024)) GB (${HW_GPU_VENDOR^^})"
+    fi
+    echo -e "    Tier: ${GREEN}${HW_TIER^^}${NC}"
+    echo ""
+    echo -e "  ${BOLD}Modelo LLM:${NC}          ${OLLAMA_MODEL}"
+    echo -e "  ${BOLD}Razão da escolha:${NC}    ${HW_MODEL_REASON}"
+    echo -e "  ${BOLD}API do Ollama:${NC}       http://localhost:${OLLAMA_PORT}"
+  else
+    echo -e "  ${BOLD}Modo:${NC}                ${CYAN}Remote Code Team${NC}"
+    echo -e "  ${BOLD}Provedor de IA:${NC}      ${CYAN}${REMOTE_PROVIDER_NAME}${NC}"
+    echo -e "  ${BOLD}Modelo:${NC}              ${CYAN}${REMOTE_MODEL}${NC}"
+    echo -e "  ${BOLD}Endpoint:${NC}            ${DIM}${REMOTE_BASE_URL}${NC}"
+    echo -e "  ${YELLOW}Lembrete:${NC} a chave de API não é gravada em disco."
+    echo -e "  ${DIM}Se reinstalar, você precisará fornecer a chave novamente.${NC}"
+  fi
+  echo -e "  ${BOLD}Porta Gateway:${NC}       ${GATEWAY_PORT}"
+  echo ""
+  echo -e "  ${BOLD}Agentes configurados:${NC}"
+  echo -e "    📋 ${CYAN}Manager${NC}       — Gerente de projeto (agente padrão)"
+  echo -e "    ⚙️  ${GREEN}Backend Dev${NC}   — Desenvolvedor backend"
+  echo -e "    🎨 ${YELLOW}Frontend Dev${NC}  — Desenvolvedor frontend"
+  echo -e "    🧪 ${RED}QA Engineer${NC}   — Engenheiro de qualidade"
+  echo ""
+  echo -e "  ${BOLD}Trocar entre agentes no chat:${NC} /agent manager | /agent backend | /agent frontend | /agent qa"
+  echo ""
+  if [[ "$INSTALL_MODE" == "local" ]]; then
+    echo -e "  ${BOLD}Limites de recursos (protegendo o servidor):${NC}"
+    local ollama_ram_lim ollama_cpu_lim
+    ollama_ram_lim=$(cat "${OPENCLAW_CONFIG_DIR}/.ollama_ram_limit" 2>/dev/null || echo "?")
+    ollama_cpu_lim=$(cat "${OPENCLAW_CONFIG_DIR}/.ollama_cpu_quota" 2>/dev/null || echo "?")
+    echo -e "    Ollama:  max ${ollama_ram_lim}M RAM, ${ollama_cpu_lim}% CPU, auto-unload em 5 min"
+    echo -e "    Gateway: limitado via systemd cgroup"
+    echo -e "    ${DIM}O modelo é descarregado da memória após 5 min sem uso.${NC}"
+  fi
+  echo ""
+  echo -e "  ${BOLD}Diretórios:${NC}"
+  echo -e "    Config:    ${OPENCLAW_CONFIG_DIR}/openclaw.json"
+  echo -e "    Agentes:   ${OPENCLAW_CONFIG_DIR}/agents/"
+  echo ""
+  echo -e "  ${BOLD}${CYAN}openclaw-ctl — controle rápido:${NC}"
+  echo -e "    ${GREEN}openclaw-ctl start${NC}     Inicia todos os serviços"
+  echo -e "    ${RED}openclaw-ctl stop${NC}      ${BOLD}Para tudo (libera CPU/RAM/GPU)${NC}"
+  echo -e "    ${CYAN}openclaw-ctl restart${NC}   Reinicia tudo"
+  echo -e "    ${CYAN}openclaw-ctl status${NC}    Status com uso de recursos"
+  echo -e "    ${CYAN}openclaw-ctl logs${NC}      Logs em tempo real"
+  echo -e "    ${CYAN}openclaw-ctl info${NC}      URLs e token de acesso"
+  echo ""
+  echo -e "  ${BOLD}Desinstalar tudo:${NC}"
+  echo -e "    ${YELLOW}sudo $0 --uninstall${NC}"
+  echo ""
+  echo -e "  ${BOLD}${YELLOW}Primeiro acesso (pairing):${NC}"
+  echo -e "    1. Abra a URL HTTPS no navegador"
+  echo -e "    2. Se aparecer ${RED}'pairing required'${NC}, execute no servidor:"
+  echo -e "       ${GREEN}openclaw-ctl approve${NC}"
+  echo -e "    3. Atualize a página do navegador"
+  echo ""
+  echo -e "  ${GREEN}${BOLD}Abra o navegador no endereço acima e comece a usar!${NC}"
+  echo ""
+}
+
+###############################################################################
+# 14. INSTALAÇÃO DO openclaw-ctl (CONTROLE CENTRALIZADO)
+###############################################################################
+install_openclaw_ctl() {
+  banner "Instalando utilitário openclaw-ctl"
+
+  cat > "$OPENCLAW_CTL_PATH" <<'CTLEOF'
+#!/usr/bin/env bash
+###############################################################################
+#  openclaw-ctl — Controle centralizado da stack OpenClaw + Ollama
+#
+#  Uso:
+#    openclaw-ctl start    — Inicia todos os serviços (Ollama + Gateway)
+#    openclaw-ctl stop     — Para todos os serviços (libera CPU/RAM/GPU)
+#    openclaw-ctl restart  — Reinicia tudo
+#    openclaw-ctl status   — Mostra status detalhado
+#    openclaw-ctl logs     — Logs em tempo real (Ctrl+C para sair)
+#    openclaw-ctl logs ollama|gateway  — Logs de um serviço específico
+#    openclaw-ctl info     — Mostra URLs de acesso e token
+#    openclaw-ctl approve  — Aprova dispositivos pendentes (fix 'pairing required')
+###############################################################################
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'; DIM='\033[2m'
+
+SERVICES=("ollama" "openclaw-gateway" "caddy")
+
+_need_sudo() {
+  if [[ $EUID -ne 0 ]]; then
+    echo -e "${YELLOW}Este comando precisa de sudo.${NC}"
+    exec sudo "$0" "$@"
+  fi
+}
+
+_svc_status_line() {
+  local svc="$1"
+  local active mem cpu
+  active=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
+
+  if [[ "$active" == "active" ]]; then
+    # Obtém uso de memória e CPU do cgroup
+    mem=$(systemctl show "$svc" --property=MemoryCurrent 2>/dev/null | cut -d= -f2)
+    if [[ -n "$mem" && "$mem" != "[not set]" && "$mem" -gt 0 ]] 2>/dev/null; then
+      mem="$(( mem / 1048576 ))M"
+    else
+      mem="-"
+    fi
+    cpu=$(systemctl show "$svc" --property=CPUUsageNSec 2>/dev/null | cut -d= -f2)
+    if [[ -n "$cpu" && "$cpu" != "[not set]" && "$cpu" -gt 0 ]] 2>/dev/null; then
+      cpu="$(( cpu / 1000000 ))ms total"
+    else
+      cpu="-"
+    fi
+    echo -e "  ${GREEN}●${NC} ${BOLD}${svc}${NC}  ${DIM}RAM: ${mem}  CPU: ${cpu}${NC}"
+  else
+    echo -e "  ${RED}○${NC} ${BOLD}${svc}${NC}  ${DIM}(${active})${NC}"
+  fi
+}
+
+cmd_start() {
+  _need_sudo "$@"
+  echo -e "${CYAN}Iniciando stack OpenClaw...${NC}"
+  for svc in "${SERVICES[@]}"; do
+    systemctl start "$svc" 2>/dev/null && \
+      echo -e "  ${GREEN}✓${NC} ${svc}" || \
+      echo -e "  ${RED}✗${NC} ${svc} (falhou)"
+  done
+  echo ""
+  echo -e "${GREEN}Stack iniciada.${NC} Use ${BOLD}openclaw-ctl status${NC} para verificar."
+}
+
+cmd_stop() {
+  _need_sudo "$@"
+  echo -e "${YELLOW}Parando stack OpenClaw (liberando recursos)...${NC}"
+  # Para na ordem inversa (gateway primeiro, depois ollama)
+  for svc in $(echo "${SERVICES[@]}" | tr ' ' '\n' | tac); do
+    systemctl stop "$svc" 2>/dev/null && \
+      echo -e "  ${GREEN}✓${NC} ${svc} parado" || \
+      echo -e "  ${DIM}  ${svc} já estava parado${NC}"
+  done
+  echo ""
+  echo -e "${GREEN}Todos os serviços parados. Recursos liberados.${NC}"
+}
+
+cmd_restart() {
+  _need_sudo "$@"
+  echo -e "${CYAN}Reiniciando stack OpenClaw...${NC}"
+  for svc in "${SERVICES[@]}"; do
+    systemctl restart "$svc" 2>/dev/null && \
+      echo -e "  ${GREEN}✓${NC} ${svc}" || \
+      echo -e "  ${RED}✗${NC} ${svc} (falhou)"
+  done
+  echo -e "${GREEN}Stack reiniciada.${NC}"
+}
+
+cmd_status() {
+  echo ""
+  echo -e "${BOLD}${CYAN}═══ OpenClaw Stack Status ═══${NC}"
+  echo ""
+  for svc in "${SERVICES[@]}"; do
+    _svc_status_line "$svc"
+  done
+
+  # Mostra modelos carregados no Ollama
+  echo ""
+  if systemctl is-active --quiet ollama 2>/dev/null; then
+    local models
+    models=$(curl -sf http://localhost:11434/api/ps 2>/dev/null | \
+      python3 -c "import sys,json;d=json.load(sys.stdin);[print(f'  {m[\"name\"]} ({m[\"size\"]//1048576}M VRAM)') for m in d.get('models',[])]" 2>/dev/null || true)
+    if [[ -n "$models" ]]; then
+      echo -e "${BOLD}Modelos carregados na memória:${NC}"
+      echo "$models"
+    else
+      echo -e "${DIM}Nenhum modelo carregado na memória (será carregado no primeiro uso).${NC}"
+    fi
+  fi
+  echo ""
+}
+
+cmd_logs() {
+  local target="${1:-all}"
+  case "$target" in
+    ollama)
+      journalctl -u ollama -f --no-hostname
+      ;;
+    gateway|openclaw|openclaw-gateway)
+      journalctl -u openclaw-gateway -f --no-hostname
+      ;;
+    all|*)
+      journalctl -u ollama -u openclaw-gateway -f --no-hostname
+      ;;
+  esac
+}
+
+cmd_info() {
+  local config_dir="$HOME/.openclaw"
+  if [[ ! -f "${config_dir}/.gw_token" ]]; then
+    # Tenta no /root se não encontrou no home do user
+    for d in /root/.openclaw /home/*/.openclaw; do
+      if [[ -f "${d}/.gw_token" ]]; then
+        config_dir="$d"
+        break
+      fi
+    done
+  fi
+
+  local token local_ip public_ip
+  token=$(cat "${config_dir}/.gw_token" 2>/dev/null || echo "???")
+  local_ip=$(cat "${config_dir}/.local_ip" 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "???")
+  public_ip=$(cat "${config_dir}/.public_ip" 2>/dev/null || echo "")
+  local port
+  port=$(systemctl show openclaw-gateway --property=Environment 2>/dev/null | \
+    grep -oP 'OPENCLAW_GATEWAY_PORT=\K[0-9]+' || echo "18789")
+
+  local https_port
+  https_port=$(cat "${config_dir}/.https_port" 2>/dev/null || echo "")
+
+  echo ""
+  echo -e "${BOLD}${CYAN}═══ OpenClaw — Informações de Acesso ═══${NC}"
+  echo ""
+
+  # HTTPS URLs (se Caddy estiver ativo)
+  if [[ -n "$https_port" ]] && systemctl is-active --quiet caddy 2>/dev/null; then
+    local hs=""
+    [[ "$https_port" != "443" ]] && hs=":${https_port}"
+    echo -e "  ${BOLD}${GREEN}HTTPS (acesso remoto):${NC}"
+    if [[ -n "$public_ip" && "$public_ip" != "$local_ip" ]]; then
+      echo -e "    ${CYAN}https://${public_ip}${hs}?token=${token}${NC}"
+    fi
+    echo -e "    ${CYAN}https://${local_ip}${hs}?token=${token}${NC}"
+    echo ""
+  fi
+
+  echo -e "  ${BOLD}HTTP:${NC}"
+  if [[ -n "$public_ip" && "$public_ip" != "$local_ip" ]]; then
+    echo -e "    ${CYAN}http://${public_ip}:${port}?token=${token}${NC}"
+  fi
+  echo -e "    ${CYAN}http://${local_ip}:${port}?token=${token}${NC}"
+  echo -e "    ${CYAN}http://localhost:${port}?token=${token}${NC}"
+  echo ""
+  echo -e "  ${BOLD}Token:${NC}   ${YELLOW}${token}${NC}"
+  echo ""
+}
+
+cmd_approve() {
+  echo -e "${CYAN}Aprovando dispositivos pendentes...${NC}"
+  # Lista dispositivos pendentes
+  local pending
+  pending=$(openclaw devices list 2>/dev/null || true)
+  if [[ -z "$pending" ]]; then
+    echo -e "${DIM}Nenhum dispositivo pendente no momento.${NC}"
+    echo ""
+    echo -e "Se o navegador mostra 'pairing required':"
+    echo -e "  1. Abra a URL no navegador (ela envia um pedido de pairing)"
+    echo -e "  2. Execute ${BOLD}openclaw-ctl approve${NC} novamente"
+    echo ""
+    return 0
+  fi
+  echo "$pending"
+  echo ""
+  # Aprova todos os pendentes
+  openclaw devices approve 2>/dev/null && \
+    echo -e "${GREEN}Dispositivos aprovados com sucesso!${NC}" || \
+    echo -e "${YELLOW}Use: openclaw devices list && openclaw devices approve <id>${NC}"
+  echo ""
+  echo -e "${DIM}Atualize a página do navegador após aprovar.${NC}"
+}
+
+cmd_help() {
+  echo ""
+  echo -e "${BOLD}openclaw-ctl${NC} — Controle da stack OpenClaw + Ollama"
+  echo ""
+  echo -e "  ${BOLD}Comandos:${NC}"
+  echo -e "    ${GREEN}start${NC}     Inicia todos os serviços"
+  echo -e "    ${RED}stop${NC}      Para tudo (libera CPU/RAM/GPU)"
+  echo -e "    ${CYAN}restart${NC}   Reinicia todos os serviços"
+  echo -e "    ${CYAN}status${NC}    Status detalhado com uso de recursos"
+  echo -e "    ${CYAN}logs${NC}      Logs em tempo real (Ctrl+C para sair)"
+  echo -e "    ${CYAN}logs${NC} ${DIM}ollama|gateway${NC}  Logs de um serviço específico"
+  echo -e "    ${CYAN}info${NC}      URLs de acesso e token"
+  echo -e "    ${GREEN}approve${NC}   Aprova dispositivos pendentes (fix 'pairing required')"
+  echo ""
+}
+
+case "${1:-help}" in
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs "${2:-all}" ;;
+  info)    cmd_info ;;
+  approve|pair) cmd_approve ;;
+  help|-h|--help) cmd_help ;;
+  *)
+    echo -e "${RED}Comando desconhecido: $1${NC}"
+    cmd_help
+    exit 1
+    ;;
+esac
+CTLEOF
+
+  chmod +x "$OPENCLAW_CTL_PATH"
+  chown root:root "$OPENCLAW_CTL_PATH"
+
+  log "openclaw-ctl instalado em ${OPENCLAW_CTL_PATH}"
+  log "Use: openclaw-ctl start | stop | status | restart | logs | info"
+}
+
+###############################################################################
+# 15. DESINSTALAÇÃO COMPLETA
+###############################################################################
+do_uninstall() {
+  banner "Desinstalação COMPLETA do OpenClaw + Ollama"
+
+  # ─── Calcula espaço ocupado pelos modelos ────────────────────────────────
+  local models_dir="${REAL_HOME}/.ollama/models"
+  local models_size="0"
+  if [[ -d "$models_dir" ]]; then
+    models_size=$(du -sh "$models_dir" 2>/dev/null | awk '{print $1}' || echo "?")
+  fi
+
+  echo -e "${YELLOW}${BOLD}ATENÇÃO: Esta operação vai remover TUDO que foi instalado:${NC}"
+  echo ""
+  echo -e "  ${RED}1.${NC} Serviço systemd: ${BOLD}openclaw-gateway${NC}"
+  echo -e "  ${RED}2.${NC} Serviço systemd: ${BOLD}ollama${NC} (serviço completo + binário)"
+  echo -e "  ${RED}3.${NC} Modelos LLM baixados: ${BOLD}${models_dir}${NC} (${YELLOW}${models_size}${NC})"
+  echo -e "  ${RED}4.${NC} Pacote npm global: ${BOLD}openclaw${NC}"
+  echo -e "  ${RED}5.${NC} Utilitário: ${BOLD}${OPENCLAW_CTL_PATH}${NC}"
+  echo -e "  ${RED}6.${NC} Configurações: ${BOLD}${OPENCLAW_CONFIG_DIR}${NC}"
+  echo -e "  ${RED}7.${NC} Caddy (reverse proxy HTTPS) — configuração e certificados"
+  echo -e "  ${RED}8.${NC} Regras de firewall e SELinux criadas pela instalação"
+  echo ""
+  echo -e "  ${DIM}Node.js/npm e Caddy (pacote) NÃO serão removidos (podem ser usados por outros projetos).${NC}"
+  echo ""
+
+  # Confirmação
+  if [[ "${2:-}" != "--yes" && "${2:-}" != "-y" ]]; then
+    echo -en "${BOLD}${RED}Tem certeza que deseja remover TUDO? [s/N]: ${NC}"
+    read -r confirm
+    if [[ "${confirm,,}" != "s" && "${confirm,,}" != "sim" && "${confirm,,}" != "y" && "${confirm,,}" != "yes" ]]; then
+      echo "Desinstalação cancelada."
+      exit 0
+    fi
+  fi
+
+  echo ""
+
+  # ─── 1. Para e remove serviço openclaw-gateway ──────────────────────────
+  info "Parando e removendo serviço openclaw-gateway..."
+  systemctl stop openclaw-gateway 2>/dev/null || true
+  systemctl disable openclaw-gateway 2>/dev/null || true
+  rm -f /etc/systemd/system/openclaw-gateway.service
+
+  # Mata processos residuais do gateway (systemctl stop pode não ser suficiente)
+  local gw_pids
+  gw_pids=$(pgrep -f "openclaw.*gateway" 2>/dev/null || true)
+  if [[ -n "$gw_pids" ]]; then
+    kill $gw_pids 2>/dev/null || true
+    sleep 1
+    # Force kill se ainda vivos
+    gw_pids=$(pgrep -f "openclaw.*gateway" 2>/dev/null || true)
+    if [[ -n "$gw_pids" ]]; then
+      kill -9 $gw_pids 2>/dev/null || true
+    fi
+  fi
+  log "Serviço openclaw-gateway removido."
+
+  # ─── 2. Para e remove Ollama completamente ──────────────────────────────
+  info "Parando e removendo Ollama completamente..."
+  systemctl stop ollama 2>/dev/null || true
+  systemctl disable ollama 2>/dev/null || true
+
+  # Mata processos residuais do Ollama
+  local ollama_pids
+  ollama_pids=$(pgrep -f "ollama" 2>/dev/null || true)
+  if [[ -n "$ollama_pids" ]]; then
+    kill $ollama_pids 2>/dev/null || true
+    sleep 1
+    ollama_pids=$(pgrep -f "ollama" 2>/dev/null || true)
+    if [[ -n "$ollama_pids" ]]; then
+      kill -9 $ollama_pids 2>/dev/null || true
+    fi
+  fi
+
+  # Remove override de configuração
+  rm -f /etc/systemd/system/ollama.service.d/override.conf
+  rmdir /etc/systemd/system/ollama.service.d 2>/dev/null || true
+
+  # Remove unit file do Ollama
+  rm -f /etc/systemd/system/ollama.service
+  rm -f /usr/lib/systemd/system/ollama.service
+
+  # Remove binário do Ollama
+  rm -f /usr/local/bin/ollama /usr/bin/ollama
+
+  # Remove usuário/grupo do Ollama (criados pelo instalador oficial)
+  if id "ollama" &>/dev/null; then
+    userdel ollama 2>/dev/null || true
+    log "Usuário 'ollama' removido."
+  fi
+  if getent group ollama &>/dev/null; then
+    groupdel ollama 2>/dev/null || true
+  fi
+
+  log "Ollama removido (binário + serviço + usuário)."
+
+  # ─── 3. Remove modelos LLM baixados ─────────────────────────────────────
+  info "Removendo modelos LLM baixados..."
+  local ollama_data_dir="${REAL_HOME}/.ollama"
+  # Também verifica /usr/share/ollama (local padrão quando roda como serviço)
+  local ollama_system_dir="/usr/share/ollama/.ollama"
+
+  local total_freed=0
+  for d in "$ollama_data_dir" "$ollama_system_dir"; do
+    if [[ -d "$d" ]]; then
+      local dir_size
+      dir_size=$(du -sb "$d" 2>/dev/null | awk '{print $1}' || echo 0)
+      total_freed=$((total_freed + dir_size))
+      rm -rf "$d"
+      log "Removido: ${d}"
+    fi
+  done
+
+  if ((total_freed > 0)); then
+    local freed_human
+    freed_human=$(numfmt --to=iec-i --suffix=B "$total_freed" 2>/dev/null || echo "${total_freed} bytes")
+    log "Espaço liberado pelos modelos: ${freed_human}"
+  else
+    log "Nenhum diretório de modelos encontrado."
+  fi
+
+  # ─── 4. Remove pacote npm openclaw ──────────────────────────────────────
+  info "Removendo pacote npm openclaw..."
+  npm uninstall -g openclaw 2>/dev/null || true
+  rm -f /usr/local/bin/openclaw 2>/dev/null || true  # remove symlink se existir
+
+  # Limpa cache npm do openclaw
+  local npm_cache_dir
+  npm_cache_dir=$(npm cache ls openclaw 2>/dev/null | head -1 | awk '{print $1}' || true)
+  if [[ -n "$npm_cache_dir" ]]; then
+    npm cache clean --force 2>/dev/null || true
+  fi
+
+  # Remove possíveis restos no npm global
+  local npm_global_dir
+  npm_global_dir=$(npm root -g 2>/dev/null || true)
+  if [[ -n "$npm_global_dir" && -d "${npm_global_dir}/openclaw" ]]; then
+    rm -rf "${npm_global_dir}/openclaw"
+    log "Restos do pacote npm removidos de ${npm_global_dir}/openclaw"
+  fi
+  log "Pacote openclaw removido."
+
+  # ─── 5. Remove openclaw-ctl ─────────────────────────────────────────────
+  info "Removendo openclaw-ctl..."
+  rm -f "$OPENCLAW_CTL_PATH"
+  log "openclaw-ctl removido."
+
+  # ─── 6. Remove configuração Caddy (HTTPS reverse proxy) ────────────────
+  info "Removendo configuração Caddy do OpenClaw..."
+  systemctl stop caddy 2>/dev/null || true
+  # Restaura Caddyfile original se existir backup
+  if [[ -f /etc/caddy/Caddyfile.bak-openclaw ]]; then
+    mv /etc/caddy/Caddyfile.bak-openclaw /etc/caddy/Caddyfile
+    log "Caddyfile original restaurado."
+  else
+    rm -f /etc/caddy/Caddyfile
+  fi
+  # Remove certificados gerados
+  rm -rf /etc/caddy/certs
+  log "Configuração Caddy do OpenClaw removida."
+  # Nota: o pacote Caddy em si é mantido (pode ser usado por outros projetos)
+
+  # ─── 7. Remove configurações (com backup) ───────────────────────────────
+  info "Removendo diretório de configurações ${OPENCLAW_CONFIG_DIR}..."
+  if [[ -d "$OPENCLAW_CONFIG_DIR" ]]; then
+    local backup_path="/tmp/openclaw-config-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    tar czf "$backup_path" -C "$(dirname "$OPENCLAW_CONFIG_DIR")" "$(basename "$OPENCLAW_CONFIG_DIR")" 2>/dev/null || true
+    rm -rf "$OPENCLAW_CONFIG_DIR"
+    log "Configurações removidas (backup em ${backup_path})."
+  fi
+
+  # ─── 8. Remove regras de firewall ───────────────────────────────────────
+  info "Removendo regras de firewall..."
+  if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    ufw delete allow 18789/tcp 2>/dev/null || true
+    ufw delete allow 11434/tcp 2>/dev/null || true
+    ufw delete allow 443/tcp 2>/dev/null || true
+    ufw reload >/dev/null 2>&1 || true
+    log "Regras ufw removidas."
+  fi
+  if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+    firewall-cmd --permanent --remove-port=18789/tcp 2>/dev/null || true
+    firewall-cmd --permanent --remove-port=11434/tcp 2>/dev/null || true
+    firewall-cmd --permanent --remove-port=443/tcp 2>/dev/null || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    log "Regras firewalld removidas."
+  fi
+
+  # ─── 9. Reverte SELinux se aplicável ────────────────────────────────────
+  if command -v getenforce &>/dev/null; then
+    local se_status
+    se_status=$(getenforce 2>/dev/null || echo "Disabled")
+    if [[ "$se_status" == "Enforcing" || "$se_status" == "Permissive" ]]; then
+      if command -v semanage &>/dev/null; then
+        semanage port -d -t http_port_t -p tcp 18789 2>/dev/null || true
+        log "Regra SELinux da porta 18789 removida."
+      fi
+      setsebool -P httpd_can_network_connect 0 2>/dev/null || true
+    fi
+  fi
+
+  systemctl daemon-reload
+
+  echo ""
+  banner "DESINSTALAÇÃO COMPLETA CONCLUÍDA"
+  echo -e "  ${GREEN}${BOLD}Tudo foi removido com sucesso:${NC}"
+  echo -e "    ${GREEN}✓${NC} OpenClaw Gateway (serviço + pacote npm)"
+  echo -e "    ${GREEN}✓${NC} Ollama (serviço + binário + usuário)"
+  echo -e "    ${GREEN}✓${NC} Modelos LLM baixados"
+  echo -e "    ${GREEN}✓${NC} Caddy (configuração HTTPS + certificados)"
+  echo -e "    ${GREEN}✓${NC} Configurações (backup salvo em /tmp/)"
+  echo -e "    ${GREEN}✓${NC} Regras de firewall e SELinux"
+  echo -e "    ${GREEN}✓${NC} openclaw-ctl"
+  echo ""
+  if ((total_freed > 0)); then
+    echo -e "  ${BOLD}Espaço total liberado:${NC} ${GREEN}${freed_human}${NC}"
+    echo ""
+  fi
+  echo -e "  ${DIM}Node.js/npm foram mantidos (podem ser usados por outros projetos).${NC}"
+  echo -e "  ${DIM}Para remover: apt remove nodejs / dnf remove nodejs${NC}"
+  echo ""
+}
+
+###############################################################################
+# MAIN
+###############################################################################
+main() {
+  # ─── Trata flags de linha de comando ────────────────────────────────────
+  case "${1:-}" in
+    --uninstall|uninstall|--remove|remove)
+      do_uninstall "$@"
+      exit 0
+      ;;
+    --help|-h|help)
+      echo "Uso:"
+      echo "  sudo $0              # Instalar OpenClaw (pergunta o tipo)"
+      echo "  sudo $0 --uninstall  # Desinstalar tudo"
+      echo ""
+      echo "Modos de instalação:"
+      echo "  [1] Local Code Team  — LLM local via Ollama (sem custos de API)"
+      echo "  [2] Remote Code Team — LLM na nuvem (OpenAI, Gemini, Groq...)"
+      echo ""
+      echo "Após instalar, use 'openclaw-ctl' para gerenciar os serviços."
+      exit 0
+      ;;
+  esac
+
+  banner "OpenClaw — Instalador Onipotente"
+  echo -e "  Início: $(date)"
+  echo ""
+
+  # ─── Pergunta o modo ANTES de qualquer instalação ────────────────────────
+  select_install_mode
+
+  detect_distro
+  resolve_ports
+  install_system_deps
+  install_nodejs
+
+  if [[ "$INSTALL_MODE" == "local" ]]; then
+    detect_hardware
+    select_model
+    install_ollama
+    install_openclaw
+    configure_ollama_network
+  else
+    # Modo remoto: coleta provedor e valida a chave antes de instalar qualquer coisa
+    select_remote_provider
+    install_openclaw
+  fi
+
+  generate_config
+  start_openclaw
+  install_openclaw_ctl
+  install_caddy_https
+  configure_firewall
+  configure_selinux
+  print_summary
+
+  echo -e "  Fim: $(date)"
+}
+
+main "$@"
