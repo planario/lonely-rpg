@@ -835,27 +835,169 @@ configure_firewall() {
 # 13. UNINSTALL
 ###############################################################################
 uninstall() {
-  banner "Uninstalling Lonely RPG Stack"
+  banner "Desinstalação do Lonely RPG"
 
-  systemctl stop openclaw 2>/dev/null || true
+  # ── Perguntar o modo de desinstalação ────────────────────────────────────
+  echo -e "  Escolha o que deseja remover:\n"
+  echo -e "  ${BOLD}1)${NC} ${GREEN}Desinstalação parcial${NC}"
+  echo -e "     Remove: serviço OpenClaw, lonely-rpg-ctl, pacote npm"
+  echo -e "     Mantém: fichas de personagem, configuração, Ollama e modelos\n"
+
+  echo -e "  ${BOLD}2)${NC} ${YELLOW}Desinstalação completa${NC}"
+  echo -e "     Remove tudo acima, mais:"
+  echo -e "       • Fichas de personagem e configuração (~/.openclaw)"
+  echo -e "       • Ollama (binário + serviço systemd)"
+  echo -e "       • Modelos LLM baixados (~/.ollama  —  pode ser grande!)\n"
+
+  echo -e "  ${BOLD}3)${NC} ${RED}Restaurar o OS ao estado anterior à instalação${NC}"
+  echo -e "     Remove tudo acima, mais:"
+  echo -e "       • Node.js (se instalado por este script via NodeSource)"
+  echo -e "       • Pacotes de sistema instalados (curl git jq openssl)\n"
+
+  local uninstall_mode=""
+  while true; do
+    read -r -p "  Escolha [1-3] ou Enter para cancelar: " uninstall_mode
+    [[ -z "$uninstall_mode" ]] && { info "Desinstalação cancelada."; exit 0; }
+    [[ "$uninstall_mode" =~ ^[123]$ ]] && break
+    warn "Opção inválida. Digite 1, 2 ou 3."
+  done
+
+  # Confirmação extra para modos destrutivos
+  if [[ "$uninstall_mode" =~ ^[23]$ ]]; then
+    local label
+    [[ "$uninstall_mode" == "2" ]] && label="COMPLETA (fichas + Ollama + modelos)"
+    [[ "$uninstall_mode" == "3" ]] && label="TOTAL — restaurar OS ao estado anterior"
+    echo ""
+    warn "Você escolheu desinstalação ${label}."
+    warn "Esta operação NÃO pode ser desfeita."
+    read -r -p "  Digite 'sim' para confirmar: " confirm
+    if [[ "$confirm" != "sim" ]]; then
+      info "Desinstalação cancelada."
+      exit 0
+    fi
+  fi
+
+  echo ""
+
+  # ── Etapa 1 (comum a todos os modos): OpenClaw ───────────────────────────
+  info "Parando e removendo OpenClaw..."
+  systemctl stop openclaw   2>/dev/null || true
   systemctl disable openclaw 2>/dev/null || true
   rm -f /etc/systemd/system/openclaw.service
-  systemctl daemon-reload
+  systemctl daemon-reload   2>/dev/null || true
 
   npm uninstall -g @openclaw/cli 2>/dev/null \
     || npm uninstall -g openclaw 2>/dev/null \
     || true
 
   rm -f "${CTL_PATH}"
+  log "OpenClaw removido"
 
-  warn "Ollama and its models were NOT removed. To remove manually:"
-  warn "  systemctl stop ollama && systemctl disable ollama"
-  warn "  rm -rf /usr/local/bin/ollama ~/.ollama"
-  warn ""
-  warn "Character sheets and config at ${OPENCLAW_CONFIG_DIR} were NOT removed."
-  warn "To remove: rm -rf ${OPENCLAW_CONFIG_DIR}"
+  # ── Etapa 2+: fichas, config e Ollama ────────────────────────────────────
+  if [[ "$uninstall_mode" -ge 2 ]]; then
 
-  log "Uninstall complete"
+    # Fichas e configuração
+    if [[ -d "${OPENCLAW_CONFIG_DIR}" ]]; then
+      rm -rf "${OPENCLAW_CONFIG_DIR}"
+      log "Fichas e configuração removidas: ${OPENCLAW_CONFIG_DIR}"
+    fi
+
+    # Ollama — serviço
+    info "Parando e removendo Ollama..."
+    systemctl stop ollama    2>/dev/null || true
+    systemctl disable ollama 2>/dev/null || true
+    rm -f /etc/systemd/system/ollama.service \
+          /usr/local/lib/systemd/system/ollama.service \
+          /lib/systemd/system/ollama.service 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+
+    # Ollama — binário
+    rm -f /usr/local/bin/ollama /usr/bin/ollama 2>/dev/null || true
+
+    # Modelos LLM (pode ocupar dezenas de GB)
+    local ollama_home="${REAL_HOME}/.ollama"
+    if [[ -d "$ollama_home" ]]; then
+      local size
+      size=$(du -sh "$ollama_home" 2>/dev/null | cut -f1 || echo "?")
+      info "Removendo modelos LLM em ${ollama_home} (${size})..."
+      rm -rf "$ollama_home"
+      log "Modelos e dados do Ollama removidos (${size} liberados)"
+    fi
+
+    # Usuário ollama (criado pelo instalador oficial)
+    if id ollama &>/dev/null; then
+      userdel -r ollama 2>/dev/null || userdel ollama 2>/dev/null || true
+      log "Usuário do sistema 'ollama' removido"
+    fi
+
+    log "Ollama completamente removido"
+  fi
+
+  # ── Etapa 3: Node.js e pacotes do sistema ────────────────────────────────
+  if [[ "$uninstall_mode" -ge 3 ]]; then
+
+    # Detectar gerenciador de pacotes
+    local pkg_mgr="unknown"
+    if command -v apt-get &>/dev/null; then pkg_mgr="apt"
+    elif command -v dnf &>/dev/null;    then pkg_mgr="dnf"
+    fi
+
+    # Node.js
+    info "Removendo Node.js..."
+    if [[ "$pkg_mgr" == "apt" ]]; then
+      apt-get remove -y nodejs npm 2>/dev/null || true
+      apt-get autoremove -y       2>/dev/null || true
+      rm -f /etc/apt/sources.list.d/nodesource.list \
+            /etc/apt/sources.list.d/nodesource.list.save \
+            /usr/share/keyrings/nodesource.gpg 2>/dev/null || true
+      apt-get update -qq 2>/dev/null || true
+    elif [[ "$pkg_mgr" == "dnf" ]]; then
+      dnf remove -y nodejs npm 2>/dev/null || true
+      rm -f /etc/yum.repos.d/nodesource*.repo 2>/dev/null || true
+    fi
+    rm -rf /usr/local/lib/node_modules 2>/dev/null || true
+    log "Node.js removido"
+
+    # Pacotes de sistema instalados pelo script
+    info "Removendo pacotes de sistema (curl, git, jq, openssl)..."
+    local sys_pkgs=(jq)   # removemos apenas o que é menos comum
+    # curl, git e openssl provavelmente existiam antes — mantemos por segurança
+    if [[ "$pkg_mgr" == "apt" ]]; then
+      apt-get remove -y "${sys_pkgs[@]}" 2>/dev/null || true
+      apt-get autoremove -y              2>/dev/null || true
+    elif [[ "$pkg_mgr" == "dnf" ]]; then
+      dnf remove -y "${sys_pkgs[@]}" 2>/dev/null || true
+    fi
+    log "Pacotes de sistema removidos"
+
+    # npm global cache / prefix
+    rm -rf "${REAL_HOME}/.npm" "${REAL_HOME}/.npmrc" 2>/dev/null || true
+    log "Cache npm removido"
+  fi
+
+  # ── Resumo ────────────────────────────────────────────────────────────────
+  echo ""
+  echo -e "${BOLD}${GREEN}=======================================${NC}"
+  echo -e "${BOLD}${GREEN}  Desinstalação concluída${NC}"
+  echo -e "${BOLD}${GREEN}=======================================${NC}"
+  echo ""
+
+  case "$uninstall_mode" in
+    1)
+      log "OpenClaw e lonely-rpg-ctl removidos"
+      info "Fichas mantidas em:  ${OPENCLAW_CONFIG_DIR}"
+      info "Ollama mantido   —  modelos disponíveis via: ollama list"
+      ;;
+    2)
+      log "OpenClaw, Ollama, modelos e fichas removidos"
+      info "Node.js e pacotes de sistema foram mantidos"
+      ;;
+    3)
+      log "Sistema restaurado ao estado anterior à instalação"
+      info "curl, git e openssl foram preservados (provavelmente preexistentes)"
+      ;;
+  esac
+  echo ""
 }
 
 ###############################################################################
