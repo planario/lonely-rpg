@@ -109,24 +109,69 @@ Durante a reconfiguração, o script verifica se já existem fichas salvas e per
 sudo ./openclaw-rpg-installer.sh --uninstall
 ```
 
-Remove:
-- Serviço systemd `openclaw`
-- Binário `lonely-rpg-ctl`
-- Pacote npm do OpenClaw
+O processo é **interativo** e oferece três modos:
 
-**Não remove automaticamente:**
-- Ollama e seus modelos (`~/.ollama/`)
-- Fichas e configurações (`~/.openclaw/`)
+---
 
-Para remover completamente:
+### Modo 1 — Desinstalação parcial *(padrão seguro)*
 
-```bash
-# Remover Ollama
-systemctl stop ollama && systemctl disable ollama
-rm -rf /usr/local/bin/ollama ~/.ollama
+Remove apenas o serviço, o binário de controle e o pacote npm.
 
-# Remover fichas e configuração
-rm -rf ~/.openclaw
+**Mantém:**
+- Fichas de personagem e configuração (`~/.openclaw/`)
+- Ollama e todos os modelos LLM baixados
+
+Ideal para pausar ou trocar de ambiente sem perder o progresso da campanha.
+
+---
+
+### Modo 2 — Desinstalação completa
+
+Remove tudo do Modo 1, mais:
+
+- Fichas e configuração (`~/.openclaw/`)
+- Serviço e binário do Ollama
+- Todos os modelos LLM (`~/.ollama/` — pode liberar dezenas de GB)
+- Usuário de sistema `ollama`
+
+> Exige confirmação digitando `sim`.
+
+---
+
+### Modo 3 — Restaurar o OS ao estado anterior
+
+Remove tudo do Modo 2, mais:
+
+- Node.js e npm (incluindo repositório NodeSource)
+- Pacote `jq` instalado pelo script
+- Cache e configuração global do npm (`~/.npm`, `~/.npmrc`)
+
+> `curl`, `git` e `openssl` são preservados por serem pré-existentes na maioria dos sistemas.
+> Exige confirmação digitando `sim`.
+
+---
+
+### Fluxo de confirmação
+
+```
+  Escolha o que deseja remover:
+
+  1) Desinstalação parcial
+     Remove: serviço OpenClaw, lonely-rpg-ctl, pacote npm
+     Mantém: fichas de personagem, configuração, Ollama e modelos
+
+  2) Desinstalação completa
+     Remove tudo acima, mais:
+       • Fichas de personagem e configuração (~/.openclaw)
+       • Ollama (binário + serviço systemd)
+       • Modelos LLM baixados (~/.ollama  —  pode ser grande!)
+
+  3) Restaurar o OS ao estado anterior à instalação
+     Remove tudo acima, mais:
+       • Node.js (se instalado por este script via NodeSource)
+       • Pacotes de sistema instalados (jq)
+
+  Escolha [1-3] ou Enter para cancelar: _
 ```
 
 ---
