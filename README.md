@@ -65,13 +65,14 @@ O instalador faz tudo automaticamente:
 3. Instala Node.js 20+ via NodeSource
 4. Analisa o hardware e escolhe o modelo LLM ideal
 5. Instala o Ollama e baixa o modelo selecionado
-6. Instala o OpenClaw via npm
-7. Cria um serviço systemd para o OpenClaw
-8. Pergunta sobre as fichas de personagem (criação ou reutilização)
-9. Configura os 4 agentes de IA (Mestre + party)
-10. Instala o utilitário `lonely-rpg-ctl`
-11. Configura o firewall (ufw ou firewalld)
-12. Exibe URL + token de acesso
+6. Instala o OpenClaw via npm e detecta automaticamente o comando correto de startup
+7. Detecta o IP do servidor para exibir a URL correta de acesso remoto
+8. Cria um serviço systemd para o OpenClaw
+9. Pergunta sobre as fichas de personagem (criação ou reutilização)
+10. Configura os 4 agentes de IA (Mestre + party)
+11. Instala o utilitário `lonely-rpg-ctl`
+12. Configura o firewall (ufw ou firewalld)
+13. Exibe as URLs de acesso local e remoto com instruções de uso do token
 
 ---
 
@@ -151,6 +152,10 @@ Remove tudo do Modo 2, mais:
 
 ---
 
+### Remoção do pacote npm
+
+O script detecta automaticamente o nome do pacote npm instalado (`@openclaw/cli`, `openclaw`, etc.) antes de tentar remover, evitando falhas silenciosas por nome errado. O binário também é removido diretamente caso ainda esteja presente no `PATH` após o `npm uninstall`.
+
 ### Fluxo de confirmação
 
 ```
@@ -173,6 +178,29 @@ Remove tudo do Modo 2, mais:
 
   Escolha [1-3] ou Enter para cancelar: _
 ```
+
+---
+
+## Acessando no Browser
+
+Ao fim da instalação, o script exibe URLs prontas para uso:
+
+```
+── Acesso no Browser ──────────────────────────────
+Na própria máquina:   http://localhost:18789
+De outro dispositivo: http://192.168.1.100:18789
+
+Token de acesso:  b7125d66fc195705cd0dfe3a807cdcff
+
+Como usar: abra a URL no browser e, quando solicitado,
+cole o token acima. Ou acesse diretamente com:
+  http://192.168.1.100:18789/?token=b7125d66fc195705cd0dfe3a807cdcff
+
+── Teste rápido via curl ──────────────────────────
+curl -H 'Authorization: Bearer <token>' http://localhost:18789/health
+```
+
+> Se o servidor tiver firewall ativo, o instalador já abre automaticamente a porta `18789` via ufw ou firewalld. Caso use outro firewall, abra a porta manualmente.
 
 ---
 
