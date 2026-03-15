@@ -83,6 +83,9 @@ HTTPS_PORT=443
 DISTRO=""
 PKG_MGR=""
 GATEWAY_TOKEN=""
+SERVER_IP=""         # Detected in detect_server_ip()
+OPENCLAW_BIN=""      # Absolute path to openclaw binary
+OPENCLAW_START_ARGS=""  # Detected startup arguments
 
 # ─── Hardware variables (filled by detect_hardware) ─────────────────────────
 HW_RAM_GB=0
@@ -298,14 +301,74 @@ install_ollama() {
 ###############################################################################
 # 6. OPENCLAW INSTALLATION
 ###############################################################################
+
+# Detect the server's primary LAN/external IP
+detect_server_ip() {
+  SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  if [[ -z "$SERVER_IP" ]]; then
+    SERVER_IP=$(ip route get 8.8.8.8 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+  fi
+  [[ -z "$SERVER_IP" ]] && SERVER_IP="localhost"
+  info "Server IP: ${SERVER_IP}"
+}
+
+# Probe the openclaw binary to find the correct startup subcommand and flags
+detect_openclaw_cmd() {
+  OPENCLAW_BIN=$(command -v openclaw 2>/dev/null || true)
+  if [[ -z "$OPENCLAW_BIN" ]]; then
+    # Some npm installs place binaries under the npm prefix/bin
+    local npm_bin
+    npm_bin=$(npm bin -g 2>/dev/null || true)
+    [[ -f "${npm_bin}/openclaw" ]] && OPENCLAW_BIN="${npm_bin}/openclaw"
+  fi
+
+  if [[ -z "$OPENCLAW_BIN" ]]; then
+    err "openclaw binary not found in PATH after install."
+    exit 1
+  fi
+
+  local help_out
+  help_out=$("$OPENCLAW_BIN" --help 2>&1 || "$OPENCLAW_BIN" help 2>&1 || true)
+
+  # Determine subcommand: prefer 'serve', fall back to 'start', then bare invocation
+  local subcmd=""
+  if   echo "$help_out" | grep -qiE '^\s*(serve|server)\b';   then subcmd="serve"
+  elif echo "$help_out" | grep -qiE '^\s*start\b';             then subcmd="start"
+  elif echo "$help_out" | grep -qiE '^\s*(run|launch)\b';      then subcmd="run"
+  fi
+
+  # Determine config flag
+  local cfg_flag=""
+  if   echo "$help_out" | grep -q '\-\-config';   then cfg_flag="--config ${OPENCLAW_CONFIG_DIR}/config.json"
+  elif echo "$help_out" | grep -q '\-\-workspace'; then cfg_flag="--workspace ${OPENCLAW_WORKSPACE_DIR}"
+  fi
+
+  # Determine port/token flags (for tools that don't use a config file)
+  local port_flag=""
+  if [[ -z "$cfg_flag" ]]; then
+    echo "$help_out" | grep -q '\-\-port'  && port_flag="--port ${GATEWAY_PORT}"
+    echo "$help_out" | grep -q '\-\-token' && port_flag="${port_flag} --token ${GATEWAY_TOKEN}"
+  fi
+
+  OPENCLAW_START_ARGS="${subcmd}${cfg_flag:+ ${cfg_flag}}${port_flag:+ ${port_flag}}"
+  # Trim leading/trailing whitespace
+  OPENCLAW_START_ARGS="${OPENCLAW_START_ARGS## }"; OPENCLAW_START_ARGS="${OPENCLAW_START_ARGS%% }"
+
+  log "OpenClaw binary: ${OPENCLAW_BIN}"
+  info "Startup args:    ${OPENCLAW_START_ARGS:-<none — bare invocation>}"
+}
+
 install_openclaw() {
   banner "Installing OpenClaw"
 
-  npm install -g @openclaw/cli --silent 2>/dev/null \
-    || npm install -g openclaw --silent 2>/dev/null \
+  npm install -g @openclaw/cli 2>/dev/null \
+    || npm install -g openclaw 2>/dev/null \
     || { err "Failed to install OpenClaw via npm. Check your npm registry."; exit 1; }
 
   log "OpenClaw installed: $(openclaw --version 2>/dev/null || echo 'version unknown')"
+
+  detect_server_ip
+  detect_openclaw_cmd
 
   cat > /etc/systemd/system/openclaw.service <<EOF
 [Unit]
@@ -318,7 +381,9 @@ Type=simple
 User=${REAL_USER}
 WorkingDirectory=${OPENCLAW_WORKSPACE_DIR}
 Environment=HOME=${REAL_HOME}
-ExecStart=$(command -v openclaw) start --config ${OPENCLAW_CONFIG_DIR}/config.json
+Environment=OPENCLAW_PORT=${GATEWAY_PORT}
+Environment=OPENCLAW_TOKEN=${GATEWAY_TOKEN}
+ExecStart=${OPENCLAW_BIN} ${OPENCLAW_START_ARGS}
 Restart=on-failure
 RestartSec=10
 CPUQuota=80%
@@ -332,6 +397,7 @@ EOF
 
   systemctl daemon-reload
   log "Systemd service created: openclaw.service"
+  log "ExecStart: ${OPENCLAW_BIN} ${OPENCLAW_START_ARGS}"
 }
 
 ###############################################################################
@@ -680,24 +746,55 @@ AGENTEOF
 ###############################################################################
 # 10. START OPENCLAW
 ###############################################################################
+
+# Return 0 if anything is listening on GATEWAY_PORT (any HTTP response)
+_gateway_up() {
+  local endpoints=("/health" "/api/health" "/api/status" "/api" "/")
+  local ep
+  for ep in "${endpoints[@]}"; do
+    if curl -sf --max-time 3 "http://localhost:${GATEWAY_PORT}${ep}" &>/dev/null; then
+      return 0
+    fi
+  done
+  # Last resort: check if the port is open at TCP level
+  if command -v ss &>/dev/null; then
+    ss -tlnp 2>/dev/null | grep -q ":${GATEWAY_PORT}" && return 0
+  fi
+  return 1
+}
+
 start_openclaw() {
   banner "Starting OpenClaw Service"
 
   systemctl enable openclaw
   systemctl restart openclaw
 
-  info "Waiting for OpenClaw gateway to come up..."
-  local retries=18
+  info "Waiting for OpenClaw gateway to come up (up to 90s)..."
+  local retries=18 elapsed=0
   while [[ $retries -gt 0 ]]; do
-    if curl -sf "http://localhost:${GATEWAY_PORT}/health" &>/dev/null; then break; fi
+    if _gateway_up; then break; fi
     sleep 5
+    elapsed=$(( elapsed + 5 ))
     (( retries-- )) || true
+    # Print a progress dot every 15s
+    (( elapsed % 15 == 0 )) && printf "  [%ds elapsed]\n" "$elapsed"
   done
 
-  if curl -sf "http://localhost:${GATEWAY_PORT}/health" &>/dev/null; then
-    log "OpenClaw gateway is running on port ${GATEWAY_PORT}"
+  if _gateway_up; then
+    log "OpenClaw gateway is up on port ${GATEWAY_PORT}"
   else
-    warn "OpenClaw gateway did not respond in 90s. Check: journalctl -u openclaw -f"
+    warn "OpenClaw gateway did not respond after 90s."
+    warn "Last ${BOLD}20 log lines${NC} from the service:"
+    echo ""
+    journalctl -u openclaw -n 20 --no-pager 2>/dev/null || true
+    echo ""
+    warn "To diagnose further:"
+    warn "  journalctl -u openclaw -f"
+    warn "  systemctl status openclaw"
+    warn ""
+    warn "The installation is otherwise complete. You can try:"
+    warn "  lonely-rpg-ctl restart"
+    warn "  lonely-rpg-ctl logs"
   fi
 }
 
@@ -881,14 +978,23 @@ uninstall() {
 
   # ── Etapa 1 (comum a todos os modos): OpenClaw ───────────────────────────
   info "Parando e removendo OpenClaw..."
-  systemctl stop openclaw   2>/dev/null || true
+  systemctl stop openclaw    2>/dev/null || true
   systemctl disable openclaw 2>/dev/null || true
   rm -f /etc/systemd/system/openclaw.service
-  systemctl daemon-reload   2>/dev/null || true
+  systemctl daemon-reload    2>/dev/null || true
 
-  npm uninstall -g @openclaw/cli 2>/dev/null \
-    || npm uninstall -g openclaw 2>/dev/null \
-    || true
+  # Find and remove the openclaw npm package — try every known package name
+  local npm_pkg
+  for npm_pkg in "@openclaw/cli" "openclaw" "@openclaw/openclaw"; do
+    if npm list -g --depth=0 2>/dev/null | grep -q "${npm_pkg}"; then
+      npm uninstall -g "${npm_pkg}" 2>/dev/null && break
+    fi
+  done
+
+  # Also remove the binary directly if it still exists
+  local oc_bin
+  oc_bin=$(command -v openclaw 2>/dev/null || true)
+  [[ -n "$oc_bin" ]] && rm -f "$oc_bin" && log "Removed binary: ${oc_bin}"
 
   rm -f "${CTL_PATH}"
   log "OpenClaw removido"
@@ -1008,34 +1114,49 @@ print_summary() {
   [[ -f "${SHEETS_DIR}/player.json" ]] && \
     player_name=$(jq -r '.name // "?"' "${SHEETS_DIR}/player.json" 2>/dev/null || echo "?")
 
+  # Ensure SERVER_IP is populated (reconfigure mode skips detect_server_ip)
+  if [[ -z "$SERVER_IP" ]]; then
+    SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [[ -z "$SERVER_IP" ]] && SERVER_IP="localhost"
+  fi
+
+  local url_local="http://localhost:${GATEWAY_PORT}"
+  local url_remote="http://${SERVER_IP}:${GATEWAY_PORT}"
+
   echo ""
   echo -e "${BOLD}${GREEN}==========================================${NC}"
   echo -e "${BOLD}${GREEN}  Lonely RPG — Pronto para Aventura!${NC}"
   echo -e "${BOLD}${GREEN}==========================================${NC}"
   echo ""
-  echo -e "  ${BOLD}Projeto:${NC}      Lonely RPG"
   echo -e "  ${BOLD}Modelo LLM:${NC}   ${OLLAMA_MODEL} (tier: ${HW_TIER})"
-  echo -e "  ${BOLD}Gateway:${NC}      http://localhost:${GATEWAY_PORT}"
-  echo -e "  ${BOLD}Token:${NC}        ${GATEWAY_TOKEN}"
   echo ""
-  echo -e "  ${BOLD}Personagem:${NC}   ${player_name}"
-  echo -e "  ${BOLD}Party:${NC}"
-  echo -e "    ${CYAN}⚔${NC}  Guerreiro  — $(jq -r '.name // "Thorin"' "${SHEETS_DIR}/party/guerreiro.json" 2>/dev/null)"
-  echo -e "    ${CYAN}✦${NC}  Mago       — $(jq -r '.name // "Elara"'  "${SHEETS_DIR}/party/mago.json"      2>/dev/null)"
-  echo -e "    ${CYAN}◈${NC}  Ladino     — $(jq -r '.name // "Sombra"' "${SHEETS_DIR}/party/ladino.json"    2>/dev/null)"
+  echo -e "  ${BOLD}── Acesso no Browser ──────────────────────────────${NC}"
+  echo -e "  Na própria máquina:  ${CYAN}${url_local}${NC}"
+  echo -e "  De outro dispositivo: ${CYAN}${url_remote}${NC}"
   echo ""
-  echo -e "  ${BOLD}Mestre:${NC}       Agente autônomo com acesso a todas as fichas"
+  echo -e "  ${BOLD}Token de acesso:${NC}  ${YELLOW}${GATEWAY_TOKEN}${NC}"
   echo ""
-  echo -e "  ${BOLD}Fichas:${NC}       ${SHEETS_DIR}/"
-  echo -e "  ${BOLD}Config:${NC}       ${OPENCLAW_CONFIG_DIR}/config.json"
+  echo -e "  ${DIM}Como usar: abra a URL no browser e, quando solicitado,${NC}"
+  echo -e "  ${DIM}cole o token acima. Ou acesse diretamente com:${NC}"
+  echo -e "  ${DIM}  ${url_remote}/?token=${GATEWAY_TOKEN}${NC}"
   echo ""
-  echo -e "  ${BOLD}Gerenciar:${NC}"
-  echo -e "    lonely-rpg-ctl start | stop | status | logs"
+  echo -e "  ${BOLD}── Teste rápido via curl ──────────────────────────${NC}"
+  echo -e "  ${DIM}curl -H 'Authorization: Bearer ${GATEWAY_TOKEN}' ${url_local}/health${NC}"
+  echo ""
+  echo -e "  ${BOLD}── Personagens ────────────────────────────────────${NC}"
+  echo -e "  Jogador:   ${player_name}"
+  echo -e "  ${CYAN}⚔${NC}  Guerreiro  — $(jq -r '.name // "Thorin"' "${SHEETS_DIR}/party/guerreiro.json" 2>/dev/null)"
+  echo -e "  ${CYAN}✦${NC}  Mago       — $(jq -r '.name // "Elara"'  "${SHEETS_DIR}/party/mago.json"      2>/dev/null)"
+  echo -e "  ${CYAN}◈${NC}  Ladino     — $(jq -r '.name // "Sombra"' "${SHEETS_DIR}/party/ladino.json"    2>/dev/null)"
+  echo ""
+  echo -e "  ${BOLD}── Gerenciar ───────────────────────────────────────${NC}"
+  echo -e "    lonely-rpg-ctl start | stop | restart | status | logs"
   echo -e "    lonely-rpg-ctl sheets"
   echo -e "    lonely-rpg-ctl sheet <player|guerreiro|mago|ladino|mestre>"
   echo ""
-  echo -e "  ${DIM}Para reconfigurar party/fichas:${NC}"
-  echo -e "  ${DIM}  sudo ./openclaw-rpg-installer.sh --reconfigure${NC}"
+  echo -e "  ${DIM}Fichas:  ${SHEETS_DIR}/${NC}"
+  echo -e "  ${DIM}Config:  ${OPENCLAW_CONFIG_DIR}/config.json${NC}"
+  echo -e "  ${DIM}Reconfigurar: sudo ./openclaw-rpg-installer.sh --reconfigure${NC}"
   echo ""
 }
 
@@ -1094,6 +1215,8 @@ main() {
       # Reload model from existing config so summary is correct
       OLLAMA_MODEL=$(jq -r '.llm.model // "unknown"' "${OPENCLAW_CONFIG_DIR}/config.json" 2>/dev/null || echo "unknown")
       HW_TIER="existing"
+
+      detect_server_ip
 
       setup_character_sheets
       configure_rpg_workspace
