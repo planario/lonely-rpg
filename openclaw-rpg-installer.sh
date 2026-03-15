@@ -171,11 +171,12 @@ install_nodejs() {
     warn "Node.js $ver found, upgrading to 20+"
   fi
 
+  # NodeSource setup scripts can return non-zero on existing configs; tolerate it
   if [[ "$PKG_MGR" == "apt" ]]; then
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    (set +e +o pipefail; curl -fsSL https://deb.nodesource.com/setup_20.x | bash -) || true
     apt-get install -y nodejs
   else
-    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+    (set +e +o pipefail; curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -) || true
     dnf install -y nodejs
   fi
 
@@ -273,7 +274,19 @@ install_ollama() {
     log "Ollama already installed — skipping binary install"
   else
     info "Downloading and installing Ollama..."
-    curl -fsSL https://ollama.ai/install.sh | sh
+    # The official Ollama installer can return non-zero on harmless warnings
+    # (e.g. "useradd: group ollama already exists"). Run in a subshell with
+    # relaxed error handling so it doesn't abort our script.
+    (
+      set +e +o pipefail
+      curl -fsSL https://ollama.ai/install.sh | sh
+    ) || true
+    # Verify the binary actually arrived
+    if ! command -v ollama &>/dev/null; then
+      err "Ollama binary not found after install attempt."
+      err "Try installing manually: https://ollama.ai/download/linux"
+      exit 1
+    fi
     log "Ollama installed"
   fi
 
