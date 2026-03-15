@@ -267,6 +267,55 @@ select_model() {
 ###############################################################################
 # 5. OLLAMA INSTALLATION
 ###############################################################################
+
+# Guarantee the ollama systemd service unit exists.
+# The official Ollama installer sometimes skips service registration when it
+# detects a pre-existing installation (group/user already present). We create
+# the unit ourselves using the same content as the official installer.
+_ensure_ollama_service() {
+  # systemctl cat exits non-zero when the unit is unknown
+  if systemctl cat ollama &>/dev/null 2>&1; then
+    log "Ollama systemd unit already registered"
+    return
+  fi
+
+  info "Ollama service unit not found — creating it..."
+  local ollama_bin
+  ollama_bin=$(command -v ollama)
+
+  # Ensure the 'ollama' system user exists (group may already exist from
+  # a previous install without a matching user)
+  if ! id ollama &>/dev/null 2>&1; then
+    if getent group ollama &>/dev/null; then
+      useradd -r -s /bin/false -g ollama -d /usr/share/ollama ollama 2>/dev/null || true
+    else
+      useradd -r -s /bin/false -m -d /usr/share/ollama ollama 2>/dev/null || true
+    fi
+    log "System user 'ollama' created"
+  fi
+
+  cat > /etc/systemd/system/ollama.service <<EOF
+[Unit]
+Description=Ollama Service
+After=network-online.target
+
+[Service]
+ExecStart=${ollama_bin} serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment="HOME=/usr/share/ollama"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  log "Ollama service unit created: /etc/systemd/system/ollama.service"
+}
+
 install_ollama() {
   banner "Installing Ollama"
 
@@ -290,18 +339,47 @@ install_ollama() {
     log "Ollama installed"
   fi
 
-  systemctl enable --now ollama 2>/dev/null || true
+  # Guarantee the service unit exists before we try to start it
+  _ensure_ollama_service
 
-  info "Waiting for Ollama to start..."
-  local retries=12
+  # The Ollama install.sh may start the process itself right after installation.
+  # Check if the API is already responding before touching systemd, to avoid
+  # a restart that resets the timer.
+  if curl -sf --max-time 3 "http://localhost:${OLLAMA_PORT}/api/tags" &>/dev/null; then
+    log "Ollama API already responding — enabling service unit only"
+    systemctl enable ollama 2>/dev/null || true
+  else
+    # Stop any leftover process from a previous install, then start cleanly
+    systemctl stop ollama 2>/dev/null || true
+    pkill -x ollama        2>/dev/null || true
+    sleep 2
+    systemctl enable ollama 2>/dev/null || true
+    systemctl start ollama  2>/dev/null || true
+  fi
+
+  info "Waiting for Ollama API (up to 120s)..."
+  local retries=24 elapsed=0
   while [[ $retries -gt 0 ]]; do
     if curl -sf "http://localhost:${OLLAMA_PORT}/api/tags" &>/dev/null; then break; fi
     sleep 5
+    elapsed=$(( elapsed + 5 ))
     (( retries-- )) || true
+    (( elapsed % 20 == 0 )) && printf "  [%ds elapsed]\n" "$elapsed"
   done
 
   if ! curl -sf "http://localhost:${OLLAMA_PORT}/api/tags" &>/dev/null; then
-    err "Ollama did not start within 60 seconds. Check: systemctl status ollama"
+    warn "Ollama API did not respond after 120s. Last service logs:"
+    echo ""
+    journalctl -u ollama -n 25 --no-pager 2>/dev/null \
+      || journalctl -xe --no-pager 2>/dev/null | tail -25 \
+      || true
+    echo ""
+    err "Ollama failed to start. Common causes on Fedora/RHEL:"
+    err "  • SELinux blocking: run 'ausearch -c ollama' for denials"
+    err "  • GPU driver issue:  run 'nvidia-smi' to verify the driver"
+    err "  • Port conflict:     run 'ss -tlnp | grep ${OLLAMA_PORT}'"
+    err ""
+    err "Fix the issue then re-run: sudo ./openclaw-rpg-installer.sh"
     exit 1
   fi
 
