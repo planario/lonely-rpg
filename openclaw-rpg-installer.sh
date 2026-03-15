@@ -294,6 +294,14 @@ _ensure_ollama_service() {
     log "System user 'ollama' created"
   fi
 
+  # Always ensure the home directory exists with correct ownership — useradd
+  # with -r does not create the home dir, and previous installs may have left
+  # the user without it, causing "permission denied" on first run.
+  mkdir -p /usr/share/ollama
+  chown ollama:ollama /usr/share/ollama
+  chmod 750 /usr/share/ollama
+  log "Ollama home directory: /usr/share/ollama"
+
   cat > /etc/systemd/system/ollama.service <<EOF
 [Unit]
 Description=Ollama Service
