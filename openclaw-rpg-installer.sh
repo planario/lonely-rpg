@@ -342,6 +342,15 @@ install_ollama() {
   # Guarantee the service unit exists before we try to start it
   _ensure_ollama_service
 
+  # Always fix the ollama home directory — this must run even when the service
+  # unit already existed and _ensure_ollama_service returned early, since the
+  # directory may still be missing or have wrong ownership from a broken
+  # previous install.
+  mkdir -p /usr/share/ollama
+  chown ollama:ollama /usr/share/ollama
+  chmod 750 /usr/share/ollama
+  log "Ollama home directory: /usr/share/ollama (ownership verified)"
+
   # The Ollama install.sh may start the process itself right after installation.
   # Check if the API is already responding before touching systemd, to avoid
   # a restart that resets the timer.
