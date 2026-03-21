@@ -4,7 +4,7 @@
 #  Compatible with: Ubuntu/Debian, Fedora/RHEL/CentOS
 #
 #  What this script does:
-#    1. Detects the distro and installs dependencies (Node 20+, curl, git, jq)
+#    1. Detects the distro and installs dependencies (Node 22+, curl, git, jq)
 #    2. Analyzes hardware (RAM, CPU, GPU NVIDIA/AMD/Intel) and automatically
 #       selects the best unrestricted LLM model for your system
 #    3. Installs Ollama and downloads the selected Dolphin-series model
@@ -159,24 +159,24 @@ install_system_deps() {
 # 3. NODE.JS 20+
 ###############################################################################
 install_nodejs() {
-  banner "Installing Node.js 20+"
+  banner "Installing Node.js 22+"
 
   if command -v node &>/dev/null; then
     local ver
     ver=$(node --version | sed 's/v//' | cut -d. -f1)
-    if [[ "$ver" -ge 20 ]]; then
+    if [[ "$ver" -ge 22 ]]; then
       log "Node.js $(node --version) already installed — skipping"
       return
     fi
-    warn "Node.js $ver found, upgrading to 20+"
+    warn "Node.js $ver found, upgrading to 22+ (current LTS)"
   fi
 
   # NodeSource setup scripts can return non-zero on existing configs; tolerate it
   if [[ "$PKG_MGR" == "apt" ]]; then
-    (set +e +o pipefail; curl -fsSL https://deb.nodesource.com/setup_20.x | bash -) || true
+    (set +e +o pipefail; curl -fsSL https://deb.nodesource.com/setup_22.x | bash -) || true
     apt-get install -y nodejs
   else
-    (set +e +o pipefail; curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -) || true
+    (set +e +o pipefail; curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -) || true
     dnf install -y nodejs
   fi
 
@@ -232,6 +232,14 @@ detect_hardware() {
 }
 
 select_model() {
+  # Skip auto-selection if --model flag was provided
+  if [[ -n "$OLLAMA_MODEL" ]]; then
+    HW_TIER="custom"
+    HW_MODEL_REASON="manually specified via --model flag"
+    log "Using user-specified model: ${OLLAMA_MODEL} (ctx: ${OLLAMA_NUM_CTX})"
+    return
+  fi
+
   local available_gb="$HW_RAM_GB"
   if [[ "$HW_GPU_VENDOR" != "none" && "$HW_GPU_VRAM_MB" -gt 0 ]]; then
     available_gb=$(( HW_GPU_VRAM_MB / 1024 ))
@@ -240,27 +248,32 @@ select_model() {
   if [[ "$available_gb" -ge 32 ]]; then
     HW_TIER="ultra"
     OLLAMA_MODEL="dolphin-llama3:70b"
+    OLLAMA_NUM_CTX=16384
     HW_MODEL_REASON="≥32 GB — full 70B Dolphin model, richest narrative and roleplay"
   elif [[ "$available_gb" -ge 16 ]]; then
     HW_TIER="high"
     OLLAMA_MODEL="dolphin-llama3:8b"
+    OLLAMA_NUM_CTX=8192
     HW_MODEL_REASON="≥16 GB — Dolphin Llama 3 8B, excellent for immersive RPG sessions"
   elif [[ "$available_gb" -ge 8 ]]; then
     HW_TIER="mid"
     OLLAMA_MODEL="dolphin-mistral:7b"
+    OLLAMA_NUM_CTX=8192
     HW_MODEL_REASON="≥8 GB — Dolphin Mistral 7B, strong storytelling with no restrictions"
   elif [[ "$available_gb" -ge 4 ]]; then
     HW_TIER="low"
     OLLAMA_MODEL="dolphin-phi"
+    OLLAMA_NUM_CTX=4096
     HW_MODEL_REASON="≥4 GB — Dolphin Phi 2.7B, capable for basic RPG interaction"
   else
     HW_TIER="minimal"
     OLLAMA_MODEL="tinydolphin"
+    OLLAMA_NUM_CTX=2048
     HW_MODEL_REASON="<4 GB — TinyDolphin 1.1B, minimal footprint; responses may be short"
     warn "Less than 4 GB available. AI responses may be brief. Consider upgrading RAM."
   fi
 
-  log "Selected model: ${OLLAMA_MODEL} (tier: ${HW_TIER})"
+  log "Selected model: ${OLLAMA_MODEL} (tier: ${HW_TIER}, ctx: ${OLLAMA_NUM_CTX})"
   info "Reason: ${HW_MODEL_REASON}"
 }
 
@@ -416,10 +429,11 @@ detect_server_ip() {
 detect_openclaw_cmd() {
   OPENCLAW_BIN=$(command -v openclaw 2>/dev/null || true)
   if [[ -z "$OPENCLAW_BIN" ]]; then
-    # Some npm installs place binaries under the npm prefix/bin
+    # Some npm installs place binaries under the npm global prefix/bin
+    # (npm bin -g was deprecated in npm 9; use npm prefix -g instead)
     local npm_bin
-    npm_bin=$(npm bin -g 2>/dev/null || true)
-    [[ -f "${npm_bin}/openclaw" ]] && OPENCLAW_BIN="${npm_bin}/openclaw"
+    npm_bin=$(npm prefix -g 2>/dev/null || true)
+    [[ -f "${npm_bin}/bin/openclaw" ]] && OPENCLAW_BIN="${npm_bin}/bin/openclaw"
   fi
 
   if [[ -z "$OPENCLAW_BIN" ]]; then
@@ -470,6 +484,13 @@ install_openclaw() {
   detect_server_ip
   detect_openclaw_cmd
 
+  # Scale MemoryMax to 75% of system RAM, clamped between 2G and 16G
+  local mem_max_gb=$(( HW_RAM_GB * 3 / 4 ))
+  [[ "$mem_max_gb" -lt 2  ]] && mem_max_gb=2
+  [[ "$mem_max_gb" -gt 16 ]] && mem_max_gb=16
+  local mem_max="${mem_max_gb}G"
+  info "OpenClaw MemoryMax: ${mem_max} (based on ${HW_RAM_GB} GB RAM)"
+
   cat > /etc/systemd/system/openclaw.service <<EOF
 [Unit]
 Description=OpenClaw — Lonely RPG AI Session
@@ -487,7 +508,7 @@ ExecStart=${OPENCLAW_BIN} ${OPENCLAW_START_ARGS}
 Restart=on-failure
 RestartSec=10
 CPUQuota=80%
-MemoryMax=6G
+MemoryMax=${mem_max}
 StandardOutput=journal
 StandardError=journal
 
@@ -722,7 +743,7 @@ configure_rpg_workspace() {
   mkdir -p "${OPENCLAW_WORKSPACE_DIR}"
   mkdir -p "${AGENTS_DIR}"
 
-  # Generate (or reuse) access token
+  # Generate (or reuse) access token; back up existing config if present
   if [[ -f "${OPENCLAW_CONFIG_DIR}/config.json" ]]; then
     local existing_token
     existing_token=$(jq -r '.gateway.auth_token // ""' "${OPENCLAW_CONFIG_DIR}/config.json" 2>/dev/null || true)
@@ -730,11 +751,20 @@ configure_rpg_workspace() {
       GATEWAY_TOKEN="$existing_token"
       log "Reusing existing auth token"
     fi
+    # Back up the existing config before overwriting
+    cp "${OPENCLAW_CONFIG_DIR}/config.json" "${OPENCLAW_CONFIG_DIR}/config.json.bak"
+    log "Config backed up: ${OPENCLAW_CONFIG_DIR}/config.json.bak"
   fi
   if [[ -z "$GATEWAY_TOKEN" ]]; then
     GATEWAY_TOKEN=$(openssl rand -hex 16 2>/dev/null \
       || head -c 16 /dev/urandom | xxd -p 2>/dev/null \
       || cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 32)
+  fi
+
+  # Build cors_origins: always allow localhost; also allow server LAN IP if known
+  local cors_origins='"http://localhost:3000", "https://localhost", "http://localhost:'"${GATEWAY_PORT}"'"'
+  if [[ -n "$SERVER_IP" && "$SERVER_IP" != "localhost" ]]; then
+    cors_origins+=', "http://'"${SERVER_IP}:${GATEWAY_PORT}"'"'
   fi
 
   # Main config
@@ -745,7 +775,7 @@ configure_rpg_workspace() {
   "gateway": {
     "port": ${GATEWAY_PORT},
     "auth_token": "${GATEWAY_TOKEN}",
-    "cors_origins": ["http://localhost:3000", "https://localhost"]
+    "cors_origins": [${cors_origins}]
   },
   "llm": {
     "provider": "ollama",
@@ -832,6 +862,23 @@ AGENTEOF
   ]
 }
 AGENTEOF
+
+  # Validate all written JSON files are well-formed
+  local json_ok=true
+  for jf in "${OPENCLAW_CONFIG_DIR}/config.json" \
+             "${AGENTS_DIR}/mestre.json" \
+             "${AGENTS_DIR}/guerreiro.json" \
+             "${AGENTS_DIR}/mago.json" \
+             "${AGENTS_DIR}/ladino.json"; do
+    if ! jq empty "$jf" 2>/dev/null; then
+      err "Invalid JSON detected in: $jf"
+      json_ok=false
+    fi
+  done
+  if [[ "$json_ok" == false ]]; then
+    err "One or more config files contain invalid JSON. Check the errors above."
+    exit 1
+  fi
 
   # Fix permissions
   chown -R "${REAL_USER}:${REAL_USER}" "${OPENCLAW_CONFIG_DIR}"
@@ -946,7 +993,6 @@ case "\${1:-help}" in
     echo ""
     echo "Jogador:"
     if [[ -f "\${SHEETS_DIR}/player.json" ]]; then
-      local n c l
       n=\$(jq -r '.name  // "?"' "\${SHEETS_DIR}/player.json" 2>/dev/null)
       c=\$(jq -r '.class // "?"' "\${SHEETS_DIR}/player.json" 2>/dev/null)
       l=\$(jq -r '.level // "?"' "\${SHEETS_DIR}/player.json" 2>/dev/null)
@@ -956,23 +1002,21 @@ case "\${1:-help}" in
     echo "Party:"
     for f in "\${SHEETS_DIR}"/party/*.json; do
       [[ -f "\$f" ]] || continue
-      local n c l
       n=\$(jq -r '.name  // "?"' "\$f" 2>/dev/null)
       c=\$(jq -r '.class // "?"' "\$f" 2>/dev/null)
       l=\$(jq -r '.level // "?"' "\$f" 2>/dev/null)
-      echo "  \${n} — \${c} Nível \${l}  (\$(basename \$f .json))"
+      echo "  \${n} — \${c} Nível \${l}  (\$(basename "\$f" .json))"
     done
     echo ""
     echo "Mestre (estado da campanha):"
     if [[ -f "\${SHEETS_DIR}/game-master.json" ]]; then
-      local arc ses
       arc=\$(jq -r '.arco_atual // "?"' "\${SHEETS_DIR}/game-master.json" 2>/dev/null)
       ses=\$(jq -r '.sessao    // "?"' "\${SHEETS_DIR}/game-master.json" 2>/dev/null)
       echo "  Arco: \${arc} | Sessão: \${ses}"
     fi
     ;;
   sheet)
-    local target="\${2:-}"
+    target="\${2:-}"
     if [[ -z "\$target" ]]; then
       echo "Usage: lonely-rpg-ctl sheet <player|guerreiro|mago|ladino|mestre>"
       exit 1
@@ -1266,19 +1310,34 @@ print_summary() {
 main() {
   # Parse arguments
   MODE="install"
-  for arg in "$@"; do
+  local i=1
+  while [[ $i -le $# ]]; do
+    arg="${!i}"
     case "$arg" in
       --uninstall|-u)    MODE="uninstall" ;;
       --reconfigure|-r)  MODE="reconfigure" ;;
+      --model)
+        i=$(( i + 1 ))
+        if [[ $i -gt $# ]]; then
+          err "--model requires a model name (e.g. --model dolphin-mistral:7b)"
+          exit 1
+        fi
+        OLLAMA_MODEL="${!i}"
+        ;;
+      --model=*)
+        OLLAMA_MODEL="${arg#--model=}"
+        ;;
       --help|-h)
         echo "Usage: sudo $0 [OPTIONS]"
         echo ""
         echo "Options:"
-        echo "  (none)          Full install: deps, Ollama, OpenClaw, party setup"
-        echo "  --reconfigure   Reconfigure party, agents and character sheets only"
-        echo "                  (skips system/Ollama/OpenClaw reinstall)"
-        echo "  --uninstall     Remove OpenClaw service and lonely-rpg-ctl"
-        echo "  --help          Show this help message"
+        echo "  (none)               Full install: deps, Ollama, OpenClaw, party setup"
+        echo "  --reconfigure        Reconfigure party, agents and character sheets only"
+        echo "                       (skips system/Ollama/OpenClaw reinstall)"
+        echo "  --uninstall          Remove OpenClaw service and lonely-rpg-ctl"
+        echo "  --model <name>       Override automatic model selection"
+        echo "                       (e.g. --model dolphin-mistral:7b)"
+        echo "  --help               Show this help message"
         echo ""
         echo "After installation, use 'lonely-rpg-ctl' to manage services."
         echo ""
@@ -1291,6 +1350,7 @@ main() {
         exit 0
         ;;
     esac
+    i=$(( i + 1 ))
   done
 
   case "$MODE" in
