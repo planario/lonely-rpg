@@ -444,12 +444,18 @@ detect_openclaw_cmd() {
   local help_out
   help_out=$("$OPENCLAW_BIN" --help 2>&1 || "$OPENCLAW_BIN" help 2>&1 || true)
 
-  # Determine subcommand: prefer 'serve', fall back to 'start', then bare invocation
+  # Determine subcommand: prefer 'serve'/'server', fall back to 'start',
+  # then use bare invocation if neither is found.
+  # NOTE: 'run' and 'launch' are intentionally excluded — these words appear
+  # frequently in help text descriptions (e.g. "to run the server") and would
+  # cause false-positive matches, resulting in "error: unknown command 'run'".
   local subcmd=""
-  if   echo "$help_out" | grep -qiE '^\s*(serve|server)\b';   then subcmd="serve"
-  elif echo "$help_out" | grep -qiE '^\s*start\b';             then subcmd="start"
-  elif echo "$help_out" | grep -qiE '^\s*(run|launch)\b';      then subcmd="run"
+  if   echo "$help_out" | grep -qiE '^\s*(serve|server)\s';   then subcmd="serve"
+  elif echo "$help_out" | grep -qiE '^\s*start\s';             then subcmd="start"
+  elif echo "$help_out" | grep -qiE '^\s*(gateway|daemon|agent)\s'; then
+    subcmd=$(echo "$help_out" | grep -iEo '^\s*(gateway|daemon|agent)\s' | head -1 | tr -d ' ')
   fi
+  # subcmd="" → bare invocation: openclaw --config ... (correct for most builds)
 
   # Determine config flag
   local cfg_flag=""
@@ -480,8 +486,15 @@ detect_openclaw_cmd() {
 
   log "OpenClaw binary: ${OPENCLAW_BIN}"
   info "Startup args:    ${OPENCLAW_START_ARGS:-<none — bare invocation>}"
+  if [[ -z "$subcmd" ]]; then
+    info "No subcommand detected — using bare invocation (openclaw <flags>)"
+  fi
   [[ -n "$host_flag" ]] && log "Bind flag detected: ${host_flag} (remote access enabled)"
-  [[ -z "$host_flag" ]] && warn "No --host/--bind flag detected; using OPENCLAW_HOST env var to set bind address"
+  if [[ -z "$host_flag" ]]; then
+    warn "No --host/--bind flag detected; relying on OPENCLAW_HOST=0.0.0.0 env var"
+    info "OpenClaw --help output (for debugging):"
+    echo "$help_out" | head -30 | sed 's/^/  /'
+  fi
 }
 
 install_openclaw() {
