@@ -453,28 +453,36 @@ detect_openclaw_cmd() {
   help_out=$(cat "$tmp_help")
   rm -f "$tmp_help"
 
-  # Extract all command names from the 'Commands:' section.
-  # Commander.js format: "  commandname[*]   description"
-  # Capture everything from 'Commands:' to the next blank-or-end.
+  # Extract command names from the 'Commands:' section using awk.
+  # awk handles both space- and tab-indented Commander.js output correctly;
+  # the previous grep/tr/sed pipeline failed silently on tab-indented output
+  # (tr -d ' ' does not remove tabs), causing gateway/daemon to not match.
+  # Commander.js format: "  commandname[*]   description text"
   local all_cmds
-  all_cmds=$(echo "$help_out" \
-    | sed -n '/^Commands:/,/^$/p' \
-    | grep -oE '^\s{2,}[a-z][a-z0-9-]+' \
-    | tr -d ' ' | sort -u || true)
-  info "Detected OpenClaw commands: ${all_cmds:-<none>}"
+  all_cmds=$(echo "$help_out" | awk '
+    /^Commands:/          { in_cmds=1; next }
+    in_cmds && /^[^ \t]/ { in_cmds=0 }
+    in_cmds && /^[ \t]+[a-z]/ {
+      cmd = $1; gsub(/[*]/, "", cmd)
+      if (cmd ~ /^[a-z][a-z0-9-]+$/) print cmd
+    }
+  ' | sort -u)
+  info "Detected OpenClaw commands: ${all_cmds:-(none)}"
 
   # Determine the subcommand used to start the gateway/web server.
-  # Priority list: the --openclaw-cmd flag (via OPENCLAW_CMD_OVERRIDE) takes
-  # precedence; otherwise we try known server-start command names in order.
+  # --openclaw-cmd flag (OPENCLAW_CMD_OVERRIDE) takes precedence.
+  # 'run' and 'launch' are excluded — they appear in help descriptions and
+  # cause false positives ("error: unknown command 'run'").
+  # 'gateway' is listed first as it is OpenClaw's canonical serve command.
   local subcmd="${OPENCLAW_CMD_OVERRIDE:-}"
 
   if [[ -z "$subcmd" ]]; then
-    # Words commonly used as the server-start subcommand in Node.js CLIs.
-    # 'run' and 'launch' are intentionally excluded — they appear in help text
-    # descriptions and cause false positives ("error: unknown command 'run'").
-    local candidates="serve server start gateway up daemon"
+    local candidates="gateway serve server start up daemon"
+    local candidate
     for candidate in $candidates; do
-      if echo "$all_cmds" | grep -qx "$candidate"; then
+      # grep -Fx: fixed-string + exact whole-line match; immune to regex
+      # metacharacters and insensitive to leading/trailing whitespace.
+      if echo "$all_cmds" | grep -qFx "$candidate"; then
         subcmd="$candidate"
         log "Server-start subcommand detected: '${subcmd}'"
         break
@@ -483,37 +491,49 @@ detect_openclaw_cmd() {
   fi
 
   if [[ -z "$subcmd" ]]; then
-    info "No server-start subcommand found in command list — using bare invocation"
-    info "Available commands were: ${all_cmds:-<none detected>}"
+    info "No server-start subcommand found — using bare invocation"
     info "Tip: re-run with --openclaw-cmd <name> to override"
   fi
 
-  # Determine config flag
+  # Capture the subcommand's own --help for flag detection.
+  # Port, config, and host flags are subcommand-specific in most CLIs;
+  # probing only the top-level help gives wrong results (false positives
+  # or misses). Use subcommand help preferentially; fall back to top-level.
+  local sub_help=""
+  if [[ -n "$subcmd" ]]; then
+    local tmp_sub
+    tmp_sub=$(mktemp /tmp/openclaw-sub-help.XXXXXX)
+    "$OPENCLAW_BIN" "$subcmd" --help > "$tmp_sub" 2>&1 || true
+    sub_help=$(cat "$tmp_sub")
+    rm -f "$tmp_sub"
+    [[ -n "$sub_help" ]] && info "Probed subcommand flags via: openclaw ${subcmd} --help"
+  fi
+  local probe_help="${sub_help:-$help_out}"
+
+  # All flag probing uses grep -qF -e PATTERN (fixed-string, explicit pattern).
+  # This avoids both BRE '\-' warnings and ambiguity from patterns starting
+  # with '--' that can confuse grep's argument parser on some systems.
   local cfg_flag=""
-  if   echo "$help_out" | grep -q '\-\-config';   then cfg_flag="--config ${OPENCLAW_CONFIG_DIR}/config.json"
-  elif echo "$help_out" | grep -q '\-\-workspace'; then cfg_flag="--workspace ${OPENCLAW_WORKSPACE_DIR}"
+  if   echo "$probe_help" | grep -qF -e '--config';    then cfg_flag="--config ${OPENCLAW_CONFIG_DIR}/config.json"
+  elif echo "$probe_help" | grep -qF -e '--workspace'; then cfg_flag="--workspace ${OPENCLAW_WORKSPACE_DIR}"
   fi
 
-  # Determine port/token flags (for tools that don't use a config file)
+  # Determine port/token flags only when no config file flag is available.
   local port_flag=""
   if [[ -z "$cfg_flag" ]]; then
-    echo "$help_out" | grep -q '\-\-port'  && port_flag="--port ${GATEWAY_PORT}"
-    echo "$help_out" | grep -q '\-\-token' && port_flag="${port_flag} --token ${GATEWAY_TOKEN}"
+    echo "$probe_help" | grep -qF -e '--port'  && port_flag="--port ${GATEWAY_PORT}"
+    echo "$probe_help" | grep -qF -e '--token' && port_flag="${port_flag} --token ${GATEWAY_TOKEN}"
   fi
 
-  # Determine host/bind flag — critical for remote access.
-  # Without this, most Node.js servers default to 127.0.0.1 (localhost only),
-  # making the web UI unreachable from other devices on the network.
-  # Check both the top-level help and the subcommand's help if one was found.
-  local subcmd_help=""
-  [[ -n "$subcmd" ]] && subcmd_help=$("$OPENCLAW_BIN" "$subcmd" --help 2>&1 || true)
-  local combined_help="${help_out} ${subcmd_help}"
-
+  # Determine host/bind flag — critical for remote network access.
+  # Without this, most Node.js servers bind to 127.0.0.1 (localhost only).
+  # Use -wF (word-match + fixed-string) to prevent matching substrings
+  # (e.g. '--host' should not match '--hostname').
   local host_flag=""
-  if   echo "$combined_help" | grep -qE '\-\-host\b';    then host_flag="--host 0.0.0.0"
-  elif echo "$combined_help" | grep -qE '\-\-bind\b';    then host_flag="--bind 0.0.0.0"
-  elif echo "$combined_help" | grep -qE '\-\-address\b'; then host_flag="--address 0.0.0.0"
-  elif echo "$combined_help" | grep -qE '\-\-listen\b';  then host_flag="--listen 0.0.0.0"
+  if   echo "$probe_help" | grep -qwF -e '--host';    then host_flag="--host 0.0.0.0"
+  elif echo "$probe_help" | grep -qwF -e '--bind';    then host_flag="--bind 0.0.0.0"
+  elif echo "$probe_help" | grep -qwF -e '--address'; then host_flag="--address 0.0.0.0"
+  elif echo "$probe_help" | grep -qwF -e '--listen';  then host_flag="--listen 0.0.0.0"
   fi
 
   OPENCLAW_START_ARGS="${subcmd}${cfg_flag:+ ${cfg_flag}}${port_flag:+ ${port_flag}}${host_flag:+ ${host_flag}}"
