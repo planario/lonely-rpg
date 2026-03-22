@@ -510,27 +510,30 @@ detect_openclaw_cmd() {
   fi
   local probe_help="${sub_help:-$help_out}"
 
-  # Use grep -F (fixed-string) to avoid 'warning: \ lost before -' that
-  # occurs when \- is used inside BRE patterns (grep without -E/-P).
+  # All flag probing uses grep -qF -e PATTERN (fixed-string, explicit pattern).
+  # This avoids both BRE '\-' warnings and ambiguity from patterns starting
+  # with '--' that can confuse grep's argument parser on some systems.
   local cfg_flag=""
-  if   echo "$probe_help" | grep -qF -- '--config';    then cfg_flag="--config ${OPENCLAW_CONFIG_DIR}/config.json"
-  elif echo "$probe_help" | grep -qF -- '--workspace'; then cfg_flag="--workspace ${OPENCLAW_WORKSPACE_DIR}"
+  if   echo "$probe_help" | grep -qF -e '--config';    then cfg_flag="--config ${OPENCLAW_CONFIG_DIR}/config.json"
+  elif echo "$probe_help" | grep -qF -e '--workspace'; then cfg_flag="--workspace ${OPENCLAW_WORKSPACE_DIR}"
   fi
 
   # Determine port/token flags only when no config file flag is available.
   local port_flag=""
   if [[ -z "$cfg_flag" ]]; then
-    echo "$probe_help" | grep -qF -- '--port'  && port_flag="--port ${GATEWAY_PORT}"
-    echo "$probe_help" | grep -qF -- '--token' && port_flag="${port_flag} --token ${GATEWAY_TOKEN}"
+    echo "$probe_help" | grep -qF -e '--port'  && port_flag="--port ${GATEWAY_PORT}"
+    echo "$probe_help" | grep -qF -e '--token' && port_flag="${port_flag} --token ${GATEWAY_TOKEN}"
   fi
 
   # Determine host/bind flag — critical for remote network access.
   # Without this, most Node.js servers bind to 127.0.0.1 (localhost only).
+  # Use -wF (word-match + fixed-string) to prevent matching substrings
+  # (e.g. '--host' should not match '--hostname').
   local host_flag=""
-  if   echo "$probe_help" | grep -qE -- '--host\b';    then host_flag="--host 0.0.0.0"
-  elif echo "$probe_help" | grep -qE -- '--bind\b';    then host_flag="--bind 0.0.0.0"
-  elif echo "$probe_help" | grep -qE -- '--address\b'; then host_flag="--address 0.0.0.0"
-  elif echo "$probe_help" | grep -qE -- '--listen\b';  then host_flag="--listen 0.0.0.0"
+  if   echo "$probe_help" | grep -qwF -e '--host';    then host_flag="--host 0.0.0.0"
+  elif echo "$probe_help" | grep -qwF -e '--bind';    then host_flag="--bind 0.0.0.0"
+  elif echo "$probe_help" | grep -qwF -e '--address'; then host_flag="--address 0.0.0.0"
+  elif echo "$probe_help" | grep -qwF -e '--listen';  then host_flag="--listen 0.0.0.0"
   fi
 
   OPENCLAW_START_ARGS="${subcmd}${cfg_flag:+ ${cfg_flag}}${port_flag:+ ${port_flag}}${host_flag:+ ${host_flag}}"
