@@ -464,12 +464,24 @@ detect_openclaw_cmd() {
     echo "$help_out" | grep -q '\-\-token' && port_flag="${port_flag} --token ${GATEWAY_TOKEN}"
   fi
 
-  OPENCLAW_START_ARGS="${subcmd}${cfg_flag:+ ${cfg_flag}}${port_flag:+ ${port_flag}}"
+  # Determine host/bind flag — critical for remote access.
+  # Without this, most Node.js servers default to 127.0.0.1 (localhost only),
+  # making the web UI unreachable from other devices on the network.
+  local host_flag=""
+  if   echo "$help_out" | grep -qE '\-\-host\b';    then host_flag="--host 0.0.0.0"
+  elif echo "$help_out" | grep -qE '\-\-bind\b';    then host_flag="--bind 0.0.0.0"
+  elif echo "$help_out" | grep -qE '\-\-address\b'; then host_flag="--address 0.0.0.0"
+  elif echo "$help_out" | grep -qE '\-\-listen\b';  then host_flag="--listen 0.0.0.0"
+  fi
+
+  OPENCLAW_START_ARGS="${subcmd}${cfg_flag:+ ${cfg_flag}}${port_flag:+ ${port_flag}}${host_flag:+ ${host_flag}}"
   # Trim leading/trailing whitespace
   OPENCLAW_START_ARGS="${OPENCLAW_START_ARGS## }"; OPENCLAW_START_ARGS="${OPENCLAW_START_ARGS%% }"
 
   log "OpenClaw binary: ${OPENCLAW_BIN}"
   info "Startup args:    ${OPENCLAW_START_ARGS:-<none — bare invocation>}"
+  [[ -n "$host_flag" ]] && log "Bind flag detected: ${host_flag} (remote access enabled)"
+  [[ -z "$host_flag" ]] && warn "No --host/--bind flag detected; using OPENCLAW_HOST env var to set bind address"
 }
 
 install_openclaw() {
@@ -504,6 +516,9 @@ WorkingDirectory=${OPENCLAW_WORKSPACE_DIR}
 Environment=HOME=${REAL_HOME}
 Environment=OPENCLAW_PORT=${GATEWAY_PORT}
 Environment=OPENCLAW_TOKEN=${GATEWAY_TOKEN}
+Environment=OPENCLAW_HOST=0.0.0.0
+Environment=HOST=0.0.0.0
+Environment=BIND_ADDRESS=0.0.0.0
 ExecStart=${OPENCLAW_BIN} ${OPENCLAW_START_ARGS}
 Restart=on-failure
 RestartSec=10
@@ -894,15 +909,24 @@ AGENTEOF
 # 10. START OPENCLAW
 ###############################################################################
 
-# Return 0 if anything is listening on GATEWAY_PORT (any HTTP response)
-_gateway_up() {
+# Return 0 if the gateway is responding on a given host
+# Usage: _gateway_up_on <host>
+_gateway_up_on() {
+  local host="$1"
   local endpoints=("/health" "/api/health" "/api/status" "/api" "/")
   local ep
   for ep in "${endpoints[@]}"; do
-    if curl -sf --max-time 3 "http://localhost:${GATEWAY_PORT}${ep}" &>/dev/null; then
+    if curl -sf --max-time 3 "http://${host}:${GATEWAY_PORT}${ep}" &>/dev/null; then
       return 0
     fi
   done
+  return 1
+}
+
+# Return 0 if the gateway is up on localhost OR via TCP port check
+_gateway_up() {
+  if _gateway_up_on "localhost"; then return 0; fi
+  if _gateway_up_on "127.0.0.1"; then return 0; fi
   # Last resort: check if the port is open at TCP level
   if command -v ss &>/dev/null; then
     ss -tlnp 2>/dev/null | grep -q ":${GATEWAY_PORT}" && return 0
@@ -929,15 +953,38 @@ start_openclaw() {
 
   if _gateway_up; then
     log "OpenClaw gateway is up on port ${GATEWAY_PORT}"
+
+    # Secondary check: verify the service is reachable from the network IP, not
+    # just localhost. If this fails the service is bound to 127.0.0.1 only.
+    if [[ -n "$SERVER_IP" && "$SERVER_IP" != "localhost" ]]; then
+      if _gateway_up_on "$SERVER_IP"; then
+        log "Remote access confirmed: http://${SERVER_IP}:${GATEWAY_PORT}"
+      else
+        warn "Gateway is UP locally but NOT reachable via ${SERVER_IP}:${GATEWAY_PORT}"
+        warn "The service may be bound to 127.0.0.1 only."
+        warn ""
+        warn "To diagnose:"
+        warn "  ss -tlnp | grep ${GATEWAY_PORT}        # check bind address"
+        warn "  journalctl -u openclaw -n 40 --no-pager"
+        warn ""
+        warn "Quick fix — check if OpenClaw respects OPENCLAW_HOST or HOST env var."
+        warn "The systemd unit already sets these; try: lonely-rpg-ctl restart"
+        warn ""
+        warn "If the problem persists, check if your firewall is blocking port ${GATEWAY_PORT}:"
+        warn "  ufw status | grep ${GATEWAY_PORT}    (Ubuntu/Debian)"
+        warn "  firewall-cmd --list-ports            (RHEL/Fedora)"
+      fi
+    fi
   else
     warn "OpenClaw gateway did not respond after 90s."
-    warn "Last ${BOLD}20 log lines${NC} from the service:"
+    warn "Last ${BOLD}30 log lines${NC} from the service:"
     echo ""
-    journalctl -u openclaw -n 20 --no-pager 2>/dev/null || true
+    journalctl -u openclaw -n 30 --no-pager 2>/dev/null || true
     echo ""
     warn "To diagnose further:"
     warn "  journalctl -u openclaw -f"
     warn "  systemctl status openclaw"
+    warn "  ss -tlnp | grep ${GATEWAY_PORT}    # is port actually in use?"
     warn ""
     warn "The installation is otherwise complete. You can try:"
     warn "  lonely-rpg-ctl restart"
@@ -1301,6 +1348,20 @@ print_summary() {
   echo -e "  ${DIM}Fichas:  ${SHEETS_DIR}/${NC}"
   echo -e "  ${DIM}Config:  ${OPENCLAW_CONFIG_DIR}/config.json${NC}"
   echo -e "  ${DIM}Reconfigurar: sudo ./openclaw-rpg-installer.sh --reconfigure${NC}"
+  echo ""
+  echo -e "  ${BOLD}── Se não conseguir conectar no browser ────────────${NC}"
+  echo -e "  ${DIM}1. Verifique se o serviço está rodando:${NC}"
+  echo -e "  ${DIM}     systemctl status openclaw${NC}"
+  echo -e "  ${DIM}2. Confirme em qual IP/porta o serviço está ouvindo:${NC}"
+  echo -e "  ${DIM}     ss -tlnp | grep ${GATEWAY_PORT}${NC}"
+  echo -e "  ${DIM}   Deve mostrar 0.0.0.0:${GATEWAY_PORT}, não 127.0.0.1:${GATEWAY_PORT}${NC}"
+  echo -e "  ${DIM}3. Teste localmente no servidor:${NC}"
+  echo -e "  ${DIM}     curl -s http://localhost:${GATEWAY_PORT}/health${NC}"
+  echo -e "  ${DIM}4. Verifique o firewall:${NC}"
+  echo -e "  ${DIM}     ufw status | grep ${GATEWAY_PORT}          (Ubuntu/Debian)${NC}"
+  echo -e "  ${DIM}     firewall-cmd --list-ports               (Fedora/RHEL)${NC}"
+  echo -e "  ${DIM}5. Veja os logs do serviço:${NC}"
+  echo -e "  ${DIM}     journalctl -u openclaw -n 50 --no-pager${NC}"
   echo ""
 }
 
