@@ -988,12 +988,10 @@ AGENTEOF
 ###############################################################################
 
 # Return 0 if the gateway is responding on a given host
-# Usage: _gateway_up_on <host>
 _gateway_up_on() {
   local host="$1"
-  local endpoints=("/health" "/api/health" "/api/status" "/api" "/")
   local ep
-  for ep in "${endpoints[@]}"; do
+  for ep in "/health" "/api/health" "/api/status" "/api" "/"; do
     if curl -sf --max-time 3 "http://${host}:${GATEWAY_PORT}${ep}" &>/dev/null; then
       return 0
     fi
@@ -1001,15 +999,38 @@ _gateway_up_on() {
   return 1
 }
 
-# Return 0 if the gateway is up on localhost OR via TCP port check
+# Return 0 if the gateway is up locally (HTTP) or at least listening (TCP)
 _gateway_up() {
-  if _gateway_up_on "localhost"; then return 0; fi
-  if _gateway_up_on "127.0.0.1"; then return 0; fi
-  # Last resort: check if the port is open at TCP level
-  if command -v ss &>/dev/null; then
-    ss -tlnp 2>/dev/null | grep -q ":${GATEWAY_PORT}" && return 0
-  fi
+  _gateway_up_on "localhost" && return 0
+  _gateway_up_on "127.0.0.1" && return 0
+  command -v ss &>/dev/null && ss -tlnp 2>/dev/null | grep -q ":${GATEWAY_PORT}" && return 0
   return 1
+}
+
+# Rewrite ExecStart in the service file and reload systemd.
+# Usage: _set_service_exec <full_exec_start_line>
+_set_service_exec() {
+  local exec_line="$1"
+  local svc="/etc/systemd/system/openclaw.service"
+  # Replace every ExecStart= line (clear any previous overrides too)
+  sed -i "s|^ExecStart=.*|ExecStart=${exec_line}|g" "$svc"
+  systemctl daemon-reload
+}
+
+# Wait up to <secs> for the gateway to respond OR the process to crash.
+# Returns 0 if gateway came up, 1 if it crashed or timed out.
+_wait_gateway() {
+  local secs="${1:-30}" elapsed=0
+  while [[ $elapsed -lt $secs ]]; do
+    sleep 3; elapsed=$(( elapsed + 3 ))
+    if _gateway_up; then return 0; fi
+    # If systemd reports the process exited (failure), bail immediately
+    # rather than waiting the full timeout on each fallback attempt.
+    if ! systemctl is-active --quiet openclaw 2>/dev/null; then
+      return 1
+    fi
+  done
+  _gateway_up && return 0 || return 1
 }
 
 start_openclaw() {
@@ -1018,55 +1039,106 @@ start_openclaw() {
   systemctl enable openclaw
   systemctl restart openclaw
 
-  info "Waiting for OpenClaw gateway to come up (up to 90s)..."
+  # ── Primary attempt ──────────────────────────────────────────────────────
+  info "Waiting for OpenClaw gateway (up to 90s)..."
   local retries=18 elapsed=0
   while [[ $retries -gt 0 ]]; do
     if _gateway_up; then break; fi
-    sleep 5
-    elapsed=$(( elapsed + 5 ))
+    sleep 5; elapsed=$(( elapsed + 5 ))
     (( retries-- )) || true
-    # Print a progress dot every 15s
     (( elapsed % 15 == 0 )) && printf "  [%ds elapsed]\n" "$elapsed"
+    # Bail early if we can already see a crash error in the logs
+    if journalctl -u openclaw -n 5 --no-pager 2>/dev/null \
+        | grep -qE "unknown option|unknown command|exit-code"; then
+      warn "Crash detected in logs — switching to fallback commands"
+      break
+    fi
   done
 
   if _gateway_up; then
-    log "OpenClaw gateway is up on port ${GATEWAY_PORT}"
+    _confirm_remote_access
+    return
+  fi
 
-    # Secondary check: verify the service is reachable from the network IP, not
-    # just localhost. If this fails the service is bound to 127.0.0.1 only.
-    if [[ -n "$SERVER_IP" && "$SERVER_IP" != "localhost" ]]; then
-      if _gateway_up_on "$SERVER_IP"; then
-        log "Remote access confirmed: http://${SERVER_IP}:${GATEWAY_PORT}"
-      else
-        warn "Gateway is UP locally but NOT reachable via ${SERVER_IP}:${GATEWAY_PORT}"
-        warn "The service may be bound to 127.0.0.1 only."
-        warn ""
-        warn "To diagnose:"
-        warn "  ss -tlnp | grep ${GATEWAY_PORT}        # check bind address"
-        warn "  journalctl -u openclaw -n 40 --no-pager"
-        warn ""
-        warn "Quick fix — check if OpenClaw respects OPENCLAW_HOST or HOST env var."
-        warn "The systemd unit already sets these; try: lonely-rpg-ctl restart"
-        warn ""
-        warn "If the problem persists, check if your firewall is blocking port ${GATEWAY_PORT}:"
-        warn "  ufw status | grep ${GATEWAY_PORT}    (Ubuntu/Debian)"
-        warn "  firewall-cmd --list-ports            (RHEL/Fedora)"
-      fi
+  # ── Auto-recovery: try progressively simpler startup commands ────────────
+  # The CLI may reject flags that were auto-detected from help text (e.g.
+  # --port is in a description sentence, not an actual option). Strip flags
+  # one at a time until the service starts, or report failure.
+  local bin="$OPENCLAW_BIN"
+  local base_subcmd="${OPENCLAW_CMD_OVERRIDE:-gateway}"  # best known subcommand
+
+  # Build fallback list: each entry is the argument string after the binary.
+  # "gateway" reads port from config.json; bind address via env var fallback.
+  local -a fallbacks=()
+
+  # If current args have --port, try without it first
+  if echo "$OPENCLAW_START_ARGS" | grep -qF -e '--port'; then
+    local no_port="${OPENCLAW_START_ARGS//--port [0-9]*/}"
+    no_port="${no_port## }"; no_port="${no_port%% }"
+    fallbacks+=("$no_port")
+  fi
+  # If current args have extra flags, try subcommand alone
+  [[ "${OPENCLAW_START_ARGS}" != "${base_subcmd}" ]] && fallbacks+=("${base_subcmd}")
+  # Bare invocation (no subcommand, rely on config + env vars entirely)
+  [[ "${OPENCLAW_START_ARGS}" != "" ]] && fallbacks+=("")
+
+  local fb attempt=1
+  for fb in "${fallbacks[@]}"; do
+    local exec_line="${bin}${fb:+ ${fb}}"
+    info "[Attempt $((attempt++))] Trying: ${exec_line}"
+
+    systemctl stop openclaw 2>/dev/null || true
+    sleep 2
+    _set_service_exec "$exec_line"
+    systemctl start openclaw
+
+    if _wait_gateway 40; then
+      log "Gateway is up with command: ${exec_line}"
+      OPENCLAW_START_ARGS="$fb"
+      _confirm_remote_access
+      return
     fi
-  else
-    warn "OpenClaw gateway did not respond after 90s."
-    warn "Last ${BOLD}30 log lines${NC} from the service:"
-    echo ""
-    journalctl -u openclaw -n 30 --no-pager 2>/dev/null || true
-    echo ""
-    warn "To diagnose further:"
-    warn "  journalctl -u openclaw -f"
-    warn "  systemctl status openclaw"
-    warn "  ss -tlnp | grep ${GATEWAY_PORT}    # is port actually in use?"
-    warn ""
-    warn "The installation is otherwise complete. You can try:"
-    warn "  lonely-rpg-ctl restart"
-    warn "  lonely-rpg-ctl logs"
+
+    warn "Command failed: ${exec_line}"
+    journalctl -u openclaw -n 5 --no-pager 2>/dev/null | sed 's/^/  /' || true
+  done
+
+  # ── All fallbacks exhausted ───────────────────────────────────────────────
+  warn "OpenClaw did not start after trying all startup variants."
+  warn "Last log lines:"
+  echo ""
+  journalctl -u openclaw -n 30 --no-pager 2>/dev/null || true
+  echo ""
+  warn "Manual fix — find the correct command:"
+  warn "  openclaw --help"
+  warn "  openclaw gateway --help"
+  warn "Then set it:"
+  warn "  sudo systemctl edit openclaw"
+  warn "  # Add:  [Service]"
+  warn "  #        ExecStart="
+  warn "  #        ExecStart=/usr/local/sbin/openclaw <correct-command>"
+  warn "  sudo systemctl restart openclaw"
+  warn ""
+  warn "Or reinstall with the correct subcommand:"
+  warn "  sudo ./openclaw-rpg-installer.sh --openclaw-cmd <name>"
+}
+
+# Verify remote reachability after the gateway is confirmed up locally.
+_confirm_remote_access() {
+  log "OpenClaw gateway is up on port ${GATEWAY_PORT}"
+  if [[ -n "$SERVER_IP" && "$SERVER_IP" != "localhost" ]]; then
+    if _gateway_up_on "$SERVER_IP"; then
+      log "Remote access confirmed: http://${SERVER_IP}:${GATEWAY_PORT}"
+    else
+      warn "Gateway is UP locally but NOT reachable via ${SERVER_IP}:${GATEWAY_PORT}"
+      warn "The service may be bound to 127.0.0.1 only."
+      warn "Check: ss -tlnp | grep ${GATEWAY_PORT}  (should show 0.0.0.0, not 127.0.0.1)"
+      warn "The systemd unit sets OPENCLAW_HOST=0.0.0.0 — restart may fix this:"
+      warn "  lonely-rpg-ctl restart"
+      warn "Firewall check:"
+      warn "  sudo firewall-cmd --list-ports    (Fedora/RHEL)"
+      warn "  sudo ufw status | grep ${GATEWAY_PORT}    (Ubuntu/Debian)"
+    fi
   fi
 }
 
