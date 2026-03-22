@@ -83,9 +83,10 @@ HTTPS_PORT=443
 DISTRO=""
 PKG_MGR=""
 GATEWAY_TOKEN=""
-SERVER_IP=""         # Detected in detect_server_ip()
-OPENCLAW_BIN=""      # Absolute path to openclaw binary
-OPENCLAW_START_ARGS=""  # Detected startup arguments
+SERVER_IP=""              # Detected in detect_server_ip()
+OPENCLAW_BIN=""           # Absolute path to openclaw binary
+OPENCLAW_START_ARGS=""    # Detected startup arguments
+OPENCLAW_CMD_OVERRIDE=""  # Optional: user-supplied subcommand (--openclaw-cmd)
 
 # ─── Hardware variables (filled by detect_hardware) ─────────────────────────
 HW_RAM_GB=0
@@ -425,7 +426,8 @@ detect_server_ip() {
   info "Server IP: ${SERVER_IP}"
 }
 
-# Probe the openclaw binary to find the correct startup subcommand and flags
+# Probe the openclaw binary to find the correct startup subcommand and flags.
+# Sets: OPENCLAW_BIN, OPENCLAW_START_ARGS
 detect_openclaw_cmd() {
   OPENCLAW_BIN=$(command -v openclaw 2>/dev/null || true)
   if [[ -z "$OPENCLAW_BIN" ]]; then
@@ -441,21 +443,50 @@ detect_openclaw_cmd() {
     exit 1
   fi
 
+  # Capture the full --help output into a temp file.
+  # Using a temp file (rather than a pipe) avoids Commander.js EPIPE errors
+  # that occur when the consumer (e.g. `head`) closes the pipe early.
+  local tmp_help
+  tmp_help=$(mktemp /tmp/openclaw-help.XXXXXX)
+  "$OPENCLAW_BIN" --help > "$tmp_help" 2>&1 || true
   local help_out
-  help_out=$("$OPENCLAW_BIN" --help 2>&1 || "$OPENCLAW_BIN" help 2>&1 || true)
+  help_out=$(cat "$tmp_help")
+  rm -f "$tmp_help"
 
-  # Determine subcommand: prefer 'serve'/'server', fall back to 'start',
-  # then use bare invocation if neither is found.
-  # NOTE: 'run' and 'launch' are intentionally excluded — these words appear
-  # frequently in help text descriptions (e.g. "to run the server") and would
-  # cause false-positive matches, resulting in "error: unknown command 'run'".
-  local subcmd=""
-  if   echo "$help_out" | grep -qiE '^\s*(serve|server)\s';   then subcmd="serve"
-  elif echo "$help_out" | grep -qiE '^\s*start\s';             then subcmd="start"
-  elif echo "$help_out" | grep -qiE '^\s*(gateway|daemon|agent)\s'; then
-    subcmd=$(echo "$help_out" | grep -iEo '^\s*(gateway|daemon|agent)\s' | head -1 | tr -d ' ')
+  # Extract all command names from the 'Commands:' section.
+  # Commander.js format: "  commandname[*]   description"
+  # Capture everything from 'Commands:' to the next blank-or-end.
+  local all_cmds
+  all_cmds=$(echo "$help_out" \
+    | sed -n '/^Commands:/,/^$/p' \
+    | grep -oE '^\s{2,}[a-z][a-z0-9-]+' \
+    | tr -d ' ' | sort -u || true)
+  info "Detected OpenClaw commands: ${all_cmds:-<none>}"
+
+  # Determine the subcommand used to start the gateway/web server.
+  # Priority list: the --openclaw-cmd flag (via OPENCLAW_CMD_OVERRIDE) takes
+  # precedence; otherwise we try known server-start command names in order.
+  local subcmd="${OPENCLAW_CMD_OVERRIDE:-}"
+
+  if [[ -z "$subcmd" ]]; then
+    # Words commonly used as the server-start subcommand in Node.js CLIs.
+    # 'run' and 'launch' are intentionally excluded — they appear in help text
+    # descriptions and cause false positives ("error: unknown command 'run'").
+    local candidates="serve server start gateway up daemon"
+    for candidate in $candidates; do
+      if echo "$all_cmds" | grep -qx "$candidate"; then
+        subcmd="$candidate"
+        log "Server-start subcommand detected: '${subcmd}'"
+        break
+      fi
+    done
   fi
-  # subcmd="" → bare invocation: openclaw --config ... (correct for most builds)
+
+  if [[ -z "$subcmd" ]]; then
+    info "No server-start subcommand found in command list — using bare invocation"
+    info "Available commands were: ${all_cmds:-<none detected>}"
+    info "Tip: re-run with --openclaw-cmd <name> to override"
+  fi
 
   # Determine config flag
   local cfg_flag=""
@@ -473,11 +504,16 @@ detect_openclaw_cmd() {
   # Determine host/bind flag — critical for remote access.
   # Without this, most Node.js servers default to 127.0.0.1 (localhost only),
   # making the web UI unreachable from other devices on the network.
+  # Check both the top-level help and the subcommand's help if one was found.
+  local subcmd_help=""
+  [[ -n "$subcmd" ]] && subcmd_help=$("$OPENCLAW_BIN" "$subcmd" --help 2>&1 || true)
+  local combined_help="${help_out} ${subcmd_help}"
+
   local host_flag=""
-  if   echo "$help_out" | grep -qE '\-\-host\b';    then host_flag="--host 0.0.0.0"
-  elif echo "$help_out" | grep -qE '\-\-bind\b';    then host_flag="--bind 0.0.0.0"
-  elif echo "$help_out" | grep -qE '\-\-address\b'; then host_flag="--address 0.0.0.0"
-  elif echo "$help_out" | grep -qE '\-\-listen\b';  then host_flag="--listen 0.0.0.0"
+  if   echo "$combined_help" | grep -qE '\-\-host\b';    then host_flag="--host 0.0.0.0"
+  elif echo "$combined_help" | grep -qE '\-\-bind\b';    then host_flag="--bind 0.0.0.0"
+  elif echo "$combined_help" | grep -qE '\-\-address\b'; then host_flag="--address 0.0.0.0"
+  elif echo "$combined_help" | grep -qE '\-\-listen\b';  then host_flag="--listen 0.0.0.0"
   fi
 
   OPENCLAW_START_ARGS="${subcmd}${cfg_flag:+ ${cfg_flag}}${port_flag:+ ${port_flag}}${host_flag:+ ${host_flag}}"
@@ -485,16 +521,9 @@ detect_openclaw_cmd() {
   OPENCLAW_START_ARGS="${OPENCLAW_START_ARGS## }"; OPENCLAW_START_ARGS="${OPENCLAW_START_ARGS%% }"
 
   log "OpenClaw binary: ${OPENCLAW_BIN}"
-  info "Startup args:    ${OPENCLAW_START_ARGS:-<none — bare invocation>}"
-  if [[ -z "$subcmd" ]]; then
-    info "No subcommand detected — using bare invocation (openclaw <flags>)"
-  fi
-  [[ -n "$host_flag" ]] && log "Bind flag detected: ${host_flag} (remote access enabled)"
-  if [[ -z "$host_flag" ]]; then
-    warn "No --host/--bind flag detected; relying on OPENCLAW_HOST=0.0.0.0 env var"
-    info "OpenClaw --help output (for debugging):"
-    echo "$help_out" | head -30 | sed 's/^/  /'
-  fi
+  log "Startup command: ${OPENCLAW_BIN} ${OPENCLAW_START_ARGS:-<no args>}"
+  [[ -n "$host_flag" ]] && log "Bind flag: ${host_flag} — remote access enabled via flag"
+  [[ -z "$host_flag" ]] && info "No --host/--bind flag found; relying on OPENCLAW_HOST=0.0.0.0 env var"
 }
 
 install_openclaw() {
@@ -1401,6 +1430,17 @@ main() {
       --model=*)
         OLLAMA_MODEL="${arg#--model=}"
         ;;
+      --openclaw-cmd)
+        i=$(( i + 1 ))
+        if [[ $i -gt $# ]]; then
+          err "--openclaw-cmd requires a subcommand name (e.g. --openclaw-cmd serve)"
+          exit 1
+        fi
+        OPENCLAW_CMD_OVERRIDE="${!i}"
+        ;;
+      --openclaw-cmd=*)
+        OPENCLAW_CMD_OVERRIDE="${arg#--openclaw-cmd=}"
+        ;;
       --help|-h)
         echo "Usage: sudo $0 [OPTIONS]"
         echo ""
@@ -1411,6 +1451,9 @@ main() {
         echo "  --uninstall          Remove OpenClaw service and lonely-rpg-ctl"
         echo "  --model <name>       Override automatic model selection"
         echo "                       (e.g. --model dolphin-mistral:7b)"
+        echo "  --openclaw-cmd <cmd> Override OpenClaw startup subcommand"
+        echo "                       (e.g. --openclaw-cmd serve)"
+        echo "                       Run 'openclaw --help' to see available commands"
         echo "  --help               Show this help message"
         echo ""
         echo "After installation, use 'lonely-rpg-ctl' to manage services."
